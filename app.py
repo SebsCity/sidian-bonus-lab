@@ -1,75 +1,104 @@
 import streamlit as st
 import pandas as pd
-from collections import Counter
+import numpy as np
+import itertools
 
-# Optimized for mobile viewing
-st.set_page_config(page_title="Sidian Bonus Lab", layout="centered")
+st.set_page_config(page_title="2–3 Hunter Engine", layout="wide")
 
-st.title("🎰 Sidian Synthesis Engine")
-st.caption("Version 1.0 - Predictive Analysis")
+st.title("🎯 2–3 Hunter Engine")
+st.caption("Prioritized 3-number selection from last 3 draws (AI weighted)")
 
-# --- DATA CACHING (Stops the slowness) ---
-@st.cache_data
-def load_and_process(file):
-    # Reads Excel and prepares frequency map once per upload
-    df = pd.read_excel(file)
-    # Extract all numbers from all columns
-    all_vals = df.select_dtypes(include=['number']).values.flatten()
-    clean_vals = [int(n) for n in all_vals if pd.notnull(n)]
-    return Counter(clean_vals)
-
-# --- SIDEBAR UPLOAD ---
-st.sidebar.header("Data Source")
-uploaded_file = st.sidebar.file_uploader("Upload 'Full A Lister 1.0'", type=["xlsx", "xls"])
+# ==========================
+# FILE UPLOAD (EXCEL)
+# ==========================
+uploaded_file = st.file_uploader("Upload Lotto History (.xlsx)", type=["xlsx"])
 
 if uploaded_file:
-    with st.spinner("Analyzing 2,278 draws..."):
-        freq_map = load_and_process(uploaded_file)
-    st.sidebar.success("Analysis Complete!")
 
-    # --- INPUT FORM (Stops lag while typing) ---
-    with st.form("main_logic_form"):
-        st.subheader("Input Previous 3 Draws")
-        st.info("Enter 6 numbers + bonus, separated by commas")
-        
-        row1 = st.text_input("Latest Draw (Draw 1)", placeholder="e.g. 1, 15, 22, 30, 41, 49, 8")
-        row2 = st.text_input("Draw 2", placeholder="e.g. 4, 10, 19, 25, 33, 40, 2")
-        row3 = st.text_input("Draw 3", placeholder="e.g. 7, 12, 18, 28, 35, 42, 11")
-        
-        submit = st.form_submit_button("GENERATE PREDICTION")
+    # Read Excel safely
+    df = pd.read_excel(uploaded_file)
 
-    if submit:
-        try:
-            # Parse all 21 numbers
-            all_inputs = []
-            for r in [row1, row2, row3]:
-                nums = [int(n.strip()) for n in r.split(',')]
-                if len(nums) != 7:
-                    st.error(f"Row error: Expected 7 numbers, found {len(nums)}")
-                    st.stop()
-                all_inputs.extend(nums)
+    st.success("Excel file loaded successfully.")
 
-            # Sidian Prediction Logic:
-            # Find the most frequent numbers in history that are NOT in the last 21 numbers.
-            recent_set = set(all_inputs)
-            sorted_history = sorted(freq_map.items(), key=lambda x: x[1], reverse=True)
-            
-            final_4 = []
-            for num, count in sorted_history:
-                if num not in recent_set:
-                    final_4.append(num)
-                if len(final_4) == 4:
-                    break
-            
-            # Result Display
-            st.divider()
-            st.success("### 🔮 Predicted Next 4 Numbers")
-            res_cols = st.columns(4)
-            for i, val in enumerate(final_4):
-                res_cols[i].metric(label=f"Rank {i+1}", value=val)
-                
-        except Exception as e:
-            st.error("Format Error: Ensure you use commas between numbers.")
+    # --------------------------
+    # Basic Cleaning
+    # --------------------------
+    df = df.dropna(how="all")
+    df = df.reset_index(drop=True)
+
+    # Assuming:
+    # Column 0 = Date
+    # Columns 1–6 = Main numbers
+    # Column 7 = Bonus (optional)
+
+    if df.shape[1] < 7:
+        st.error("File format incorrect. Expecting at least 7 columns.")
+        st.stop()
+
+    number_columns = df.columns[1:8]  # 6 mains + bonus
+    df = df.sort_values(by=df.columns[0])
+
+    # ==========================
+    # EXTRACT LAST 3 DRAWS
+    # ==========================
+    last3 = df.tail(3)
+
+    pool = []
+    for col in number_columns:
+        pool.extend(last3[col].values)
+
+    pool = [int(x) for x in pool if pd.notnull(x)]
+
+    st.subheader("📊 Last 3 Draws Pool (21 Numbers)")
+    st.write(pool)
+
+    # ==========================
+    # AI WEIGHTED SCORING
+    # ==========================
+    scores = {}
+
+    for number in set(pool):
+        scores[number] = 0
+
+    # Frequency weighting
+    for number in pool:
+        scores[number] += pool.count(number) * 3
+
+    # Recency bonus (latest draw)
+    latest_draw = last3.iloc[-1][number_columns].values
+    for number in latest_draw:
+        scores[number] += 2
+
+    # Overheat penalty (appears in all 3 draws)
+    for number in set(pool):
+        if pool.count(number) >= 3:
+            scores[number] -= 2
+
+    # Sort ranked numbers
+    ranked_numbers = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    st.subheader("🧠 Ranked Numbers (AI Weighted)")
+    st.write(ranked_numbers)
+
+    # ==========================
+    # BUILD 3-NUMBER HUNTER SETS
+    # ==========================
+    top_numbers = [num for num, score in ranked_numbers[:7]]
+
+    combos = list(itertools.combinations(top_numbers, 3))
+
+    combo_scores = []
+
+    for combo in combos:
+        combo_score = sum(scores[n] for n in combo)
+        combo_scores.append((combo, combo_score))
+
+    combo_scores = sorted(combo_scores, key=lambda x: x[1], reverse=True)
+
+    st.subheader("🔥 Top Prioritized 3-Number Hunter Sets")
+
+    for combo, score in combo_scores[:5]:
+        st.write(f"{combo}  | Score: {score}")
 
 else:
-    st.warning("Please upload your Excel file in the sidebar to start the engine.")
+    st.info("Upload your Excel file (.xlsx) to begin.")
