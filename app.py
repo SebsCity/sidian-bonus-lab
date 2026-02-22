@@ -1,82 +1,59 @@
 import streamlit as st
-import pandas as pd
-from collections import Counter
+import itertools
 
-st.set_page_config(page_title="Sidian Tri-Tier Lab", layout="wide")
+def generate_hot_pool_app():
+    st.title("🎰 Sebman Duo Generator")
+    st.subheader("Strategy: Previous & 3rd Previous Draw (n-1 & n-3)")
 
-st.title("🎰 Sidian Synthesis Engine")
-st.subheader("Tri-Tier Signature Analysis")
+    st.write("""
+    Enter the 7 numbers (including Bonus) from your two chosen draws to identify 
+    the 'Hot Pool' and generate potential winning pairs.
+    """)
 
-@st.cache_data
-def analyze_signature_probabilities(file):
-    df = pd.read_excel(file)
-    draw_data = df.select_dtypes(include=['number']).values
+    col1, col2 = st.columns(2)
+
+    with col1:
+        draw_n1 = st.text_input("Draw n-1 (7 numbers, comma separated)", "1, 8, 34, 39, 46, 49, 47")
     
-    repeat_tally = Counter()
-    total_occurrences = Counter()
+    with col2:
+        draw_n3 = st.text_input("Draw n-3 (7 numbers, comma separated)", "6, 17, 18, 33, 41, 43, 26")
 
-    # Scan 2,278 draws in windows of 4
-    for i in range(len(draw_data) - 4):
-        past_3_draws = set(draw_data[i:i+3].flatten())
-        next_draw = set(draw_data[i+3])
-        
-        for num in past_3_draws:
-            total_occurrences[num] += 1
-            if num in next_draw:
-                repeat_tally[num] += 1
-                
-    # Calculate Repeat Probability (Repeat / Total)
-    # Higher = Most Likely to repeat; Lower = Least Likely (Decay)
-    return {num: repeat_tally[num] / total_occurrences[num] for num in total_occurrences}
+    if st.button("Generate Hot Pool & Duos"):
+        try:
+            # Clean and parse input
+            set1 = set([int(x.strip()) for x in draw_n1.split(",")])
+            set2 = set([int(x.strip()) for x in draw_n3.split(",")])
 
-uploaded_file = st.sidebar.file_uploader("Upload 'Full A Lister 1.0'", type=["xlsx", "xls"])
+            if len(set1) != 7 or len(set2) != 7:
+                st.warning("Please ensure both sets have exactly 7 numbers.")
+                return
 
-with st.form("tritier_logic_form"):
-    st.write("Enter your 21 numbers to categorize them into Signature Tiers.")
-    col_a, col_b, col_c = st.columns(3)
-    row1 = col_a.text_input("Latest Draw")
-    row2 = col_b.text_input("Draw 2")
-    row3 = col_c.text_input("Draw 3")
-    submit = st.form_submit_button("Generate Tri-Tier Report", type="primary")
+            # Calculate unique pool
+            hot_pool = sorted(list(set1.union(set2)))
+            overlap = set1.intersection(set2)
 
-if submit and uploaded_file:
-    prob_map = analyze_signature_probabilities(uploaded_file)
-    current_21 = list(set([int(n) for n in (row1 + " " + row2 + " " + row3).replace(",", " ").split() if n.isdigit()]))
-    
-    if len(current_21) >= 12:
-        # Score and Sort
-        scored = sorted([(num, prob_map.get(num, 0.5)) for num in current_21], key=lambda x: x[1], reverse=True)
-        
-        most_likely = scored[:4]        # Top 4
-        least_likely = scored[-4:]      # Bottom 4
-        
-        # Calculate the middle index for 'Between'
-        mid = len(scored) // 2
-        between = scored[mid-2:mid+2]   # Middle 4
+            # Display Analysis
+            st.divider()
+            st.success(f"✅ Hot Pool Identified: {len(hot_pool)} Unique Numbers")
+            st.write(f"**The Hot Pool:** `{hot_pool}`")
+            
+            if overlap:
+                st.info(f"Numbers appearing in both draws: `{list(overlap)}`")
+            else:
+                st.info("No overlapping numbers found.")
 
-        # --- DISPLAY RESULTS ---
-        st.divider()
-        
-        c1, c2, c3 = st.columns(3)
-        
-        with c1:
-            st.success("### 🔥 Most Likely")
-            st.caption("Highest Repeat Rate")
-            for n, p in most_likely:
-                st.metric(label=f"Num {n}", value=f"{p:.1%}")
+            # Generate Duos (Pairs)
+            all_pairs = list(itertools.combinations(hot_pool, 2))
+            
+            st.subheader(f"Generated Duos ({len(all_pairs)} total pairs)")
+            
+            # Display pairs in a clean grid
+            cols = st.columns(4)
+            for i, pair in enumerate(all_pairs):
+                cols[i % 4].write(f"Pair {i+1}: **{pair[0]} - {pair[1]}**")
 
-        with c2:
-            st.warning("### ⚖️ The Between")
-            st.caption("Neutral Equilibrium")
-            for n, p in between:
-                st.metric(label=f"Num {n}", value=f"{p:.1%}")
+        except ValueError:
+            st.error("Please enter valid numbers separated by commas (e.g., 1, 2, 3, 4, 5, 6, 7)")
 
-        with c3:
-            st.error("### 🧊 Least Likely")
-            st.caption("Highest Decay Rate")
-            for n, p in least_likely:
-                st.metric(label=f"Num {n}", value=f"{p:.1%}")
-    else:
-        st.error("Please enter at least 12 unique numbers across the 3 draws.")
-
-st.sidebar.info("Method: Sidian Tri-Tier Signature Extraction")
+if __name__ == "__main__":
+    generate_hot_pool_app()
