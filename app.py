@@ -2,22 +2,43 @@ import streamlit as st
 import pandas as pd
 from collections import Counter
 
-st.set_page_config(page_title="Sidian Signature Lab", layout="centered")
+st.set_page_config(page_title="Sidian Filter Lab", layout="centered")
 
 st.title("🎰 Sidian Synthesis Engine")
-st.subheader("Machine Signature Analysis")
+st.subheader("Historical Non-Repeater Analysis")
 
-# --- DATASET LOADING ---
+# --- DATASET PROCESSING ---
 @st.cache_data
-def analyze_historical_signature(file):
+def analyze_non_repeater_signature(file):
     df = pd.read_excel(file)
-    # We create a sequence of all draws to find 'look-alike' moments
-    return df
+    # Ensure we only look at the numeric draw columns
+    draw_data = df.select_dtypes(include=['number']).values
+    
+    non_repeater_tally = Counter()
+    total_window_occurrences = Counter()
+
+    # Scan history in windows of 4 (3 draws input -> 1 draw result)
+    for i in range(len(draw_data) - 4):
+        past_3_draws = set(draw_data[i:i+3].flatten())
+        next_draw = set(draw_data[i+3])
+        
+        for num in past_3_draws:
+            total_window_occurrences[num] += 1
+            if num not in next_draw:
+                # This number was present in the 3-draw window but NOT in the 4th
+                non_repeater_tally[num] += 1
+                
+    # Calculate the 'Non-Repeat Probability' for every number in history
+    probabilities = {}
+    for num in total_window_occurrences:
+        probabilities[num] = non_repeater_tally[num] / total_window_occurrences[num]
+        
+    return probabilities
 
 uploaded_file = st.sidebar.file_uploader("Upload 'Full A Lister 1.0'", type=["xlsx", "xls"])
 
-with st.form("signature_logic_form"):
-    st.write("Input the 21 numbers (7 per row) to find the historical match.")
+with st.form("filter_logic_form"):
+    st.write("Input your 21 numbers to find which are historically least likely to repeat.")
     
     def parse_input(text):
         return [int(n.strip()) for n in text.replace(",", " ").split() if n.strip().isdigit()]
@@ -26,56 +47,37 @@ with st.form("signature_logic_form"):
     row2 = st.text_input("Draw 2")
     row3 = st.text_input("Draw 3")
     
-    submit = st.form_submit_button("Run Signature Analysis", type="primary")
+    submit = st.form_submit_button("Run Filter Analysis", type="primary")
 
 if submit and uploaded_file:
-    hist_df = analyze_historical_signature(uploaded_file)
-    current_21 = parse_input(row1) + parse_input(row2) + parse_input(row3)
+    with st.spinner("Calculating Historical Decay Rates..."):
+        prob_map = analyze_non_repeater_signature(uploaded_file)
     
-    if len(current_21) == 21:
-        # --- THE SIGNATURE LOGIC ---
-        # 1. We look for 'Buddy Numbers' in history
-        # We find instances where the numbers you just entered appeared together
-        flat_history = hist_df.values.flatten()
+    current_21 = list(set(parse_input(row1) + parse_input(row2) + parse_input(row3)))
+    
+    if len(current_21) > 0:
+        # Score your 21 numbers based on their historical 'Non-Repeat' probability
+        scored_numbers = []
+        for num in current_21:
+            # If the number isn't in history, we give it a neutral score
+            score = prob_map.get(num, 0.5) 
+            scored_numbers.append((num, score))
         
-        # 2. Analyze the 'Repeat Rate' in the datasheet
-        # We look for how often numbers from a 3-draw window repeated in the 4th draw
-        repeater_frequency = []
-        
-        # We scan the history in windows of 4 draws (3 to analyze, 1 to check the result)
-        # This is the 'Decay Visualization' logic
-        for i in range(len(hist_df) - 4):
-            past_window = hist_df.iloc[i:i+3].values.flatten()
-            next_draw = hist_df.iloc[i+3].values.flatten()
-            
-            # Find which numbers from that past window repeated in the next draw
-            repeats = set(past_window).intersection(set(next_draw))
-            repeater_frequency.extend(list(repeats))
-        
-        # 3. Match your current 21 against the historical 'Repeaters'
-        signature_counts = Counter(repeater_frequency)
-        
-        # Rank your 21 numbers based on how often they historically 'Repeat'
-        weighted_predictions = []
-        for num in set(current_21):
-            weight = signature_counts.get(num, 0)
-            weighted_predictions.append((num, weight))
-        
-        # Sort by highest historical repeat probability
-        weighted_predictions.sort(key=lambda x: x[1], reverse=True)
-        final_4 = [x[0] for x in weighted_predictions[:4]]
+        # Sort by HIGHEST probability of NOT repeating
+        scored_numbers.sort(key=lambda x: x[1], reverse=True)
+        final_4 = scored_numbers[:4]
 
         # --- RESULTS ---
         st.divider()
-        st.success("### 🔮 Predicted Signature Repeats:")
-        st.write("These numbers from your 21 inputs have the highest historical 'Machine Repeat' rate.")
+        st.error("### 📉 Predicted Non-Repeaters:")
+        st.write("Based on 2,278 draws, these numbers from your input are historically most likely to **STAY OUT** of the next draw.")
         
         cols = st.columns(4)
-        for i, val in enumerate(final_4):
-            cols[i].metric(label=f"Rank {i+1}", value=val)
+        for i, (val, prob) in enumerate(final_4):
+            cols[i].metric(label=f"Rank {i+1}", value=int(val), delta=f"{prob:.1%} Decay", delta_color="inverse")
             
-        st.caption("Logic: Analyzed 2,278 draws to find which of your 21 inputs are historically most likely to repeat.")
+        st.caption("Logic: High Decay Score = Number historically disappears after appearing in a 3-draw window.")
     else:
-        st.error("Please ensure you have entered exactly 21 numbers.")
+        st.error("Please enter your draws correctly.")
 
-st.sidebar.info("Method: Historical Repeat Correlation")
+st.sidebar.info("Method: Decay Visualization & Signature Filtering")
