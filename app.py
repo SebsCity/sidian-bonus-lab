@@ -1,90 +1,87 @@
 import streamlit as st
-import re
+from collections import Counter
 
 # Mobile-friendly layout
 st.set_page_config(page_title="Sidian Bonus Lab", layout="centered")
 
 st.title("🎰 Sidian Synthesis Engine")
-st.markdown("### Internal Pattern Analysis (Input-Only)")
+st.subheader("Repeater Logic Mode")
+st.markdown("Goal: Identify which numbers are likely to **repeat**.")
 
 # --- SECTION: INPUT DRAWS ---
-with st.form("sidian_internal_form"):
-    st.subheader("Input 3 Previous Draws")
-    st.caption("Enter 6 main numbers + 1 bonus (7 total per row)")
-    st.caption("You can separate numbers with spaces OR commas")
+with st.form("sidian_repeater_form"):
+    st.write("Input format: 6 main numbers + 1 bonus (7 total per row)")
 
     def parse_numbers(text):
-        # Replace commas with spaces, then split
         clean_text = text.replace(",", " ")
         parts = clean_text.split()
-        
-        numbers = []
-        for p in parts:
-            if p.isdigit():
-                numbers.append(int(p))
-            else:
-                raise ValueError("Invalid character detected.")
-        return numbers
+        return [int(p) for p in parts if p.isdigit()]
 
     def get_input_row(label):
-        val = st.text_input(label, placeholder="e.g. 1 10 15 22 30 45 7")
+        val = st.text_input(label, placeholder="e.g. 5 12 22 30 31 45 8")
         if val:
-            try:
-                nums = parse_numbers(val)
-                if len(nums) == 7:
-                    return nums
-                else:
-                    st.warning(f"{label} needs exactly 7 numbers. You entered {len(nums)}.")
-            except:
-                st.error("Use numbers separated by spaces or commas only.")
+            nums = parse_numbers(val)
+            if len(nums) == 7: return nums
+            else: st.warning(f"Enter 7 numbers for {label}.")
         return []
 
     d1 = get_input_row("Latest Draw")
     d2 = get_input_row("Draw 2")
     d3 = get_input_row("Draw 3")
 
-    submit = st.form_submit_button("Generate Prediction", type="primary")
+    submit = st.form_submit_button("Analyze for Repeaters", type="primary")
 
-# --- SECTION: LOGIC ---
+# --- SECTION: NEW REPEATER LOGIC ---
 if submit:
     all_inputs = d1 + d2 + d3
     
     if len(all_inputs) < 21:
-        st.error("Please provide all 21 numbers to calculate the pattern.")
+        st.error("Please provide all 3 draws (21 numbers total).")
     else:
-        avg_val = sum(all_inputs) / len(all_inputs)
-        min_val = min(all_inputs)
-        max_val = max(all_inputs)
-
-        sorted_inputs = sorted(list(set(all_inputs)))
+        # 1. Count frequencies (Which numbers already repeated?)
+        counts = Counter(all_inputs)
+        
+        # 2. Calculate the mathematical 'Hot Zone' (Average)
+        avg_val = int(sum(all_inputs) / len(all_inputs))
+        
+        # 3. Build the Prediction List
         predictions = []
-        potential_target = int(avg_val)
-
-        offsets = [-2, 2, -5, 5]
-
-        for offset in offsets:
-            candidate = potential_target + offset
-            
-            if 1 <= candidate <= 52 and candidate not in all_inputs:
+        
+        # STRATEGY A: Prioritize numbers that appeared MORE THAN ONCE in the 21 inputs
+        repeaters = [num for num, count in counts.items() if count > 1]
+        predictions.extend(repeaters)
+        
+        # STRATEGY B: Check the 'Hot Zone' neighbors
+        # If these neighbors are in your recent 21, they are high-priority
+        hot_zone = [avg_val, avg_val - 1, avg_val + 1, avg_val + 5, avg_val - 5]
+        
+        for candidate in hot_zone:
+            if candidate in all_inputs: # This is the 'Conflict Solver' flip
                 predictions.append(candidate)
-            else:
-                fallback = candidate + 1
-                while fallback in all_inputs and fallback <= 52:
-                    fallback += 1
-                if 1 <= fallback <= 52:
-                    predictions.append(fallback)
-
+        
+        # 4. Clean up: Remove duplicates and limit to 4
+        # We use dict.fromkeys to keep the priority order
         final_4 = list(dict.fromkeys(predictions))[:4]
+        
+        # Fallback: If we still don't have 4 (unlikely with 21 inputs), 
+        # just pick the highest numbers from the input
+        if len(final_4) < 4:
+            additional = sorted(list(set(all_inputs)), reverse=True)
+            for num in additional:
+                if num not in final_4:
+                    final_4.append(num)
+                if len(final_4) == 4: break
 
+        # --- DISPLAY RESULTS ---
         st.divider()
         st.balloons()
-        st.write("### 🔮 Predicted Next 4 (Internal Logic):")
-
+        st.write("### 🔮 Predicted Repeaters:")
+        
         cols = st.columns(4)
         for i, p_num in enumerate(final_4):
-            cols[i].metric(label=f"Position {i+1}", value=p_num)
+            cols[i].metric(label=f"Rank {i+1}", value=p_num)
 
-        st.caption("Logic: Calculated via Mean Center and Exclusion Gaps from your 21 inputs.")
+        st.info("Logic: Priority given to numbers appearing multiple times in inputs or falling in the 'Hot Zone' average.")
 
 st.sidebar.write("Developed for **Sidian Brand**")
-st.sidebar.info("Currently running on **Internal Synthesis mode** (Ignoring Datasheet).")
+st.sidebar.info("Running: **Repeater Preference Mode**")
