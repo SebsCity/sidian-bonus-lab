@@ -1,104 +1,81 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import itertools
 
-st.set_page_config(page_title="2–3 Hunter Engine", layout="wide")
+# Mobile-friendly layout
+st.set_page_config(page_title="Sidian Bonus Lab", layout="centered")
 
-st.title("🎯 2–3 Hunter Engine")
-st.caption("Prioritized 3-number selection from last 3 draws (AI weighted)")
+st.title("🎰 Sidian Synthesis Engine")
+st.markdown("### Internal Pattern Analysis (Input-Only)")
 
-# ==========================
-# FILE UPLOAD (EXCEL)
-# ==========================
-uploaded_file = st.file_uploader("Upload Lotto History (.xlsx)", type=["xlsx"])
+# --- SECTION: INPUT DRAWS ---
+# We use a form to make it fast on Android
+with st.form("sidian_internal_form"):
+    st.subheader("Input 3 Previous Draws")
+    st.caption("Enter 6 main numbers + 1 bonus (7 total per row)")
 
-if uploaded_file:
+    def get_input_row(label):
+        val = st.text_input(label, placeholder="e.g. 1, 10, 15, 22, 30, 45, 7")
+        if val:
+            try:
+                nums = [int(n.strip()) for n in val.split(',')]
+                if len(nums) == 7:
+                    return nums
+                else:
+                    st.warning(f"Row needs 7 numbers. You have {len(nums)}.")
+            except:
+                st.error("Please use numbers and commas only.")
+        return []
 
-    # Read Excel safely
-    df = pd.read_excel(uploaded_file)
+    d1 = get_input_row("Latest Draw")
+    d2 = get_input_row("Draw 2")
+    d3 = get_input_row("Draw 3")
+    
+    submit = st.form_submit_button("Generate Prediction", type="primary")
 
-    st.success("Excel file loaded successfully.")
+# --- SECTION: LOGIC (No Uploaded Data) ---
+if submit:
+    all_inputs = d1 + d2 + d3
+    
+    if len(all_inputs) < 21:
+        st.error("Please provide all 21 numbers to calculate the pattern.")
+    else:
+        # 1. Calculate Average (The 'Balance' Number)
+        avg_val = sum(all_inputs) / len(all_inputs)
+        
+        # 2. Identify the Range
+        min_val = min(all_inputs)
+        max_val = max(all_inputs)
+        
+        # 3. Pattern Generation (Mathematical Offsets)
+        # We look for numbers that fill the gaps between your inputs
+        sorted_inputs = sorted(list(set(all_inputs)))
+        
+        predictions = []
+        # Logic: Pick numbers near the average that weren't in the input
+        potential_target = int(avg_val)
+        
+        # Generate 4 distinct numbers based on proximity to the 'Sidian Center'
+        offsets = [-2, 2, -5, 5] 
+        for offset in offsets:
+            candidate = potential_target + offset
+            # Ensure candidate is within standard lotto range and not in the recent 21
+            if 1 <= candidate <= 52 and candidate not in all_inputs:
+                predictions.append(candidate)
+            else:
+                # Fallback if the offset hits a recent number
+                predictions.append(candidate + 1 if candidate + 1 not in all_inputs else candidate + 3)
 
-    # --------------------------
-    # Basic Cleaning
-    # --------------------------
-    df = df.dropna(how="all")
-    df = df.reset_index(drop=True)
+        # Ensure we only have 4 unique numbers
+        final_4 = list(set(predictions))[:4]
 
-    # Assuming:
-    # Column 0 = Date
-    # Columns 1–6 = Main numbers
-    # Column 7 = Bonus (optional)
+        # Display Results
+        st.divider()
+        st.balloons()
+        st.write("### 🔮 Predicted Next 4 (Internal Logic):")
+        cols = st.columns(4)
+        for i, p_num in enumerate(final_4):
+            cols[i].metric(label=f"Position {i+1}", value=p_num)
+        
+        st.caption("Logic: Calculated via Mean Center and Exclusion Gaps from your 21 inputs.")
 
-    if df.shape[1] < 7:
-        st.error("File format incorrect. Expecting at least 7 columns.")
-        st.stop()
-
-    number_columns = df.columns[1:8]  # 6 mains + bonus
-    df = df.sort_values(by=df.columns[0])
-
-    # ==========================
-    # EXTRACT LAST 3 DRAWS
-    # ==========================
-    last3 = df.tail(3)
-
-    pool = []
-    for col in number_columns:
-        pool.extend(last3[col].values)
-
-    pool = [int(x) for x in pool if pd.notnull(x)]
-
-    st.subheader("📊 Last 3 Draws Pool (21 Numbers)")
-    st.write(pool)
-
-    # ==========================
-    # AI WEIGHTED SCORING
-    # ==========================
-    scores = {}
-
-    for number in set(pool):
-        scores[number] = 0
-
-    # Frequency weighting
-    for number in pool:
-        scores[number] += pool.count(number) * 3
-
-    # Recency bonus (latest draw)
-    latest_draw = last3.iloc[-1][number_columns].values
-    for number in latest_draw:
-        scores[number] += 2
-
-    # Overheat penalty (appears in all 3 draws)
-    for number in set(pool):
-        if pool.count(number) >= 3:
-            scores[number] -= 2
-
-    # Sort ranked numbers
-    ranked_numbers = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    st.subheader("🧠 Ranked Numbers (AI Weighted)")
-    st.write(ranked_numbers)
-
-    # ==========================
-    # BUILD 3-NUMBER HUNTER SETS
-    # ==========================
-    top_numbers = [num for num, score in ranked_numbers[:7]]
-
-    combos = list(itertools.combinations(top_numbers, 3))
-
-    combo_scores = []
-
-    for combo in combos:
-        combo_score = sum(scores[n] for n in combo)
-        combo_scores.append((combo, combo_score))
-
-    combo_scores = sorted(combo_scores, key=lambda x: x[1], reverse=True)
-
-    st.subheader("🔥 Top Prioritized 3-Number Hunter Sets")
-
-    for combo, score in combo_scores[:5]:
-        st.write(f"{combo}  | Score: {score}")
-
-else:
-    st.info("Upload your Excel file (.xlsx) to begin.")
+st.sidebar.write("Developed for **Sidian Brand**")
+st.sidebar.info("Currently running on **Internal Synthesis mode** (Ignoring Datasheet).")
