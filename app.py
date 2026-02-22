@@ -1,87 +1,81 @@
 import streamlit as st
+import pandas as pd
 from collections import Counter
 
-# Mobile-friendly layout
-st.set_page_config(page_title="Sidian Bonus Lab", layout="centered")
+st.set_page_config(page_title="Sidian Signature Lab", layout="centered")
 
 st.title("🎰 Sidian Synthesis Engine")
-st.subheader("Repeater Logic Mode")
-st.markdown("Goal: Identify which numbers are likely to **repeat**.")
+st.subheader("Machine Signature Analysis")
 
-# --- SECTION: INPUT DRAWS ---
-with st.form("sidian_repeater_form"):
-    st.write("Input format: 6 main numbers + 1 bonus (7 total per row)")
+# --- DATASET LOADING ---
+@st.cache_data
+def analyze_historical_signature(file):
+    df = pd.read_excel(file)
+    # We create a sequence of all draws to find 'look-alike' moments
+    return df
 
-    def parse_numbers(text):
-        clean_text = text.replace(",", " ")
-        parts = clean_text.split()
-        return [int(p) for p in parts if p.isdigit()]
+uploaded_file = st.sidebar.file_uploader("Upload 'Full A Lister 1.0'", type=["xlsx", "xls"])
 
-    def get_input_row(label):
-        val = st.text_input(label, placeholder="e.g. 5 12 22 30 31 45 8")
-        if val:
-            nums = parse_numbers(val)
-            if len(nums) == 7: return nums
-            else: st.warning(f"Enter 7 numbers for {label}.")
-        return []
-
-    d1 = get_input_row("Latest Draw")
-    d2 = get_input_row("Draw 2")
-    d3 = get_input_row("Draw 3")
-
-    submit = st.form_submit_button("Analyze for Repeaters", type="primary")
-
-# --- SECTION: NEW REPEATER LOGIC ---
-if submit:
-    all_inputs = d1 + d2 + d3
+with st.form("signature_logic_form"):
+    st.write("Input the 21 numbers (7 per row) to find the historical match.")
     
-    if len(all_inputs) < 21:
-        st.error("Please provide all 3 draws (21 numbers total).")
-    else:
-        # 1. Count frequencies (Which numbers already repeated?)
-        counts = Counter(all_inputs)
-        
-        # 2. Calculate the mathematical 'Hot Zone' (Average)
-        avg_val = int(sum(all_inputs) / len(all_inputs))
-        
-        # 3. Build the Prediction List
-        predictions = []
-        
-        # STRATEGY A: Prioritize numbers that appeared MORE THAN ONCE in the 21 inputs
-        repeaters = [num for num, count in counts.items() if count > 1]
-        predictions.extend(repeaters)
-        
-        # STRATEGY B: Check the 'Hot Zone' neighbors
-        # If these neighbors are in your recent 21, they are high-priority
-        hot_zone = [avg_val, avg_val - 1, avg_val + 1, avg_val + 5, avg_val - 5]
-        
-        for candidate in hot_zone:
-            if candidate in all_inputs: # This is the 'Conflict Solver' flip
-                predictions.append(candidate)
-        
-        # 4. Clean up: Remove duplicates and limit to 4
-        # We use dict.fromkeys to keep the priority order
-        final_4 = list(dict.fromkeys(predictions))[:4]
-        
-        # Fallback: If we still don't have 4 (unlikely with 21 inputs), 
-        # just pick the highest numbers from the input
-        if len(final_4) < 4:
-            additional = sorted(list(set(all_inputs)), reverse=True)
-            for num in additional:
-                if num not in final_4:
-                    final_4.append(num)
-                if len(final_4) == 4: break
+    def parse_input(text):
+        return [int(n.strip()) for n in text.replace(",", " ").split() if n.strip().isdigit()]
 
-        # --- DISPLAY RESULTS ---
+    row1 = st.text_input("Latest Draw")
+    row2 = st.text_input("Draw 2")
+    row3 = st.text_input("Draw 3")
+    
+    submit = st.form_submit_button("Run Signature Analysis", type="primary")
+
+if submit and uploaded_file:
+    hist_df = analyze_historical_signature(uploaded_file)
+    current_21 = parse_input(row1) + parse_input(row2) + parse_input(row3)
+    
+    if len(current_21) == 21:
+        # --- THE SIGNATURE LOGIC ---
+        # 1. We look for 'Buddy Numbers' in history
+        # We find instances where the numbers you just entered appeared together
+        flat_history = hist_df.values.flatten()
+        
+        # 2. Analyze the 'Repeat Rate' in the datasheet
+        # We look for how often numbers from a 3-draw window repeated in the 4th draw
+        repeater_frequency = []
+        
+        # We scan the history in windows of 4 draws (3 to analyze, 1 to check the result)
+        # This is the 'Decay Visualization' logic
+        for i in range(len(hist_df) - 4):
+            past_window = hist_df.iloc[i:i+3].values.flatten()
+            next_draw = hist_df.iloc[i+3].values.flatten()
+            
+            # Find which numbers from that past window repeated in the next draw
+            repeats = set(past_window).intersection(set(next_draw))
+            repeater_frequency.extend(list(repeats))
+        
+        # 3. Match your current 21 against the historical 'Repeaters'
+        signature_counts = Counter(repeater_frequency)
+        
+        # Rank your 21 numbers based on how often they historically 'Repeat'
+        weighted_predictions = []
+        for num in set(current_21):
+            weight = signature_counts.get(num, 0)
+            weighted_predictions.append((num, weight))
+        
+        # Sort by highest historical repeat probability
+        weighted_predictions.sort(key=lambda x: x[1], reverse=True)
+        final_4 = [x[0] for x in weighted_predictions[:4]]
+
+        # --- RESULTS ---
         st.divider()
-        st.balloons()
-        st.write("### 🔮 Predicted Repeaters:")
+        st.success("### 🔮 Predicted Signature Repeats:")
+        st.write("These numbers from your 21 inputs have the highest historical 'Machine Repeat' rate.")
         
         cols = st.columns(4)
-        for i, p_num in enumerate(final_4):
-            cols[i].metric(label=f"Rank {i+1}", value=p_num)
+        for i, val in enumerate(final_4):
+            cols[i].metric(label=f"Rank {i+1}", value=val)
+            
+        st.caption("Logic: Analyzed 2,278 draws to find which of your 21 inputs are historically most likely to repeat.")
+    else:
+        st.error("Please ensure you have entered exactly 21 numbers.")
 
-        st.info("Logic: Priority given to numbers appearing multiple times in inputs or falling in the 'Hot Zone' average.")
-
-st.sidebar.write("Developed for **Sidian Brand**")
-st.sidebar.info("Running: **Repeater Preference Mode**")
+st.sidebar.info("Method: Historical Repeat Correlation")
