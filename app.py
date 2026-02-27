@@ -1,132 +1,278 @@
+# ==========================================
+# Lotto Duo Compression (Drop-in Module)
+# Upload historical draws (CSV/XLSX) -> build -5/+5/±5 candidates from latest draw
+# -> compress into EXACTLY 4 duos (or configurable)
+# ==========================================
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Sequence, Set, Dict, Optional
+
+import pandas as pd
 import streamlit as st
-import itertools
 
-def run_strategy_hub_app():
-    st.set_page_config(page_title="Sebman Strategy Hub", page_icon="🎯", layout="centered")
-    
-    st.title("🎯 Sebman Strategy Hub")
-    
-    # Create two tabs
-    tab1, tab2 = st.tabs(["⚓ Daily Anchor (Duos)", "🔥 Trio Triggers (R500 Payouts)"])
-    
-    # ==========================================
-    # TAB 1: DYNAMIC ANCHOR STRATEGY (DUOS)
-    # ==========================================
-    with tab1:
-        st.subheader("Strategy: 42-Density Filtered by Anchor Gaps")
-        st.write("Use this **every day**. It anchors numbers from your **n-1** and **n-3** draws based on your target gap to catch clustered numbers for Duo wins (R50).")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            draw_n1 = st.text_input("Draw n-1 (Required)", "4 10 14 20 42 49 12", key="n1_input")
-        with col2:
-            draw_n3 = st.text_input("Draw n-3 (Required)", "5 7 14 19 30 40 15", key="n3_input")
-            
-        st.divider()
-        max_gap = st.slider("Maximum Gap Allowed (Your Sweet Spot is 10):", min_value=1, max_value=25, value=10, step=1)
-        
-        if st.button("Generate Anchored Duos", key="btn_anchor"):
-            try:
-                set1 = set([int(x.strip()) for x in draw_n1.replace(',', ' ').split()])
-                set2 = set([int(x.strip()) for x in draw_n3.replace(',', ' ').split()])
-                
-                if len(set1) != 7 or len(set2) != 7:
-                    st.warning("Check your input! Both draws must have exactly 7 unique numbers.")
-                else:
-                    base_pairs = set(itertools.combinations(sorted(list(set1)), 2)).union(set(itertools.combinations(sorted(list(set2)), 2)))
-                    filtered_pairs = sorted([p for p in base_pairs if 1 <= abs(p[0] - p[1]) <= max_gap])
-                    
-                    stake = len(filtered_pairs)
-                    if stake > 0:
-                        st.success(f"✅ Generated {stake} Playable Duos (Cost: R{stake})")
-                        anchors = sorted(list(set([p[0] for p in filtered_pairs])))
-                        for anchor in anchors:
-                            anchor_pairs = [p for p in filtered_pairs if p[0] == anchor]
-                            pair_strings = [f"**{p[0]} & {p[1]}** *(Gap {abs(p[0]-p[1])})*" for p in anchor_pairs]
-                            st.markdown(f"### Anchored to {anchor}")
-                            st.write(" • " + " | ".join(pair_strings))
-                            st.write("---")
-                    else:
-                        st.error("No valid intervals today! Keep your money in your pocket.")
-            except ValueError:
-                st.error("Invalid input. Use spaces or commas.")
 
-    # ==========================================
-    # TAB 2: TRIO TRIGGERS (SNIPER & SNOWBALL)
-    # ==========================================
-    with tab2:
-        st.subheader("🔥 The R500 Trio Triggers")
-        st.write("""
-        Paste the results of **last night's draw**. The system will scan the board and alert you 
-        if either of your two mathematically explosive Trio strategies are primed to hit tonight.
-        """)
-        
-        # Define the Elite Sets
-        elite_40s = [40, 41, 42, 43, 44, 49]
-        elite_20s = [20, 21, 22, 23, 24, 26]
-        
-        # Generate Combinations
-        trios_40s = sorted(list(itertools.combinations(elite_40s, 3)))
-        trios_20s = sorted(list(itertools.combinations(elite_20s, 3)))
-        
-        latest_draw_input = st.text_input("Enter Last Night's Draw (7 numbers):", "14 22 29 34 38 46 17", key="latest_draw_input")
+# ---------------------------
+# CONFIG
+# ---------------------------
+@dataclass(frozen=True)
+class CompressionConfig:
+    min_num: int = 1
+    max_num: int = 49
+    duos_count: int = 4          # set to 4 for your request
+    prefer_spacing: int = 5      # stabilizer spread preference
 
-        if st.button("Scan for Triggers", key="btn_scan"):
-            try:
-                latest_set = set([int(x.strip()) for x in latest_draw_input.replace(',', ' ').split()])
-                
-                if len(latest_set) == 7:
-                    st.divider()
-                    st.write("### 🚦 Dashboard Analysis")
-                    
-                    # Analyze Hits
-                    hits_40s = len(latest_set.intersection(set(elite_40s)))
-                    hits_20s = len(latest_set.intersection(set(elite_20s)))
-                    
-                    # Status Trackers
-                    play_40s = (hits_40s == 1)
-                    play_20s = (hits_20s >= 2)
-                    
-                    # --- 1. EVALUATE HIGH 40s (SNIPER TRAP) ---
-                    if play_40s:
-                        st.success(f"🟢 **HIGH 40s SNIPER TRAP ACTIVATED!**")
-                        st.write(f"*(Exactly 1 Elite 40s number dropped yesterday. The Warning Shot was fired. They are primed to cluster tonight!)*")
-                    else:
-                        st.error(f"🔴 **HIGH 40s INACTIVE** ({hits_40s} hits yesterday. Requires exactly 1.)")
-                        
-                    # --- 2. EVALUATE 20s (SNOWBALL EFFECT) ---
-                    if play_20s:
-                        st.success(f"🟢 **20s SNOWBALL EFFECT ACTIVATED!**")
-                        st.write(f"*(Multiple Elite 20s dropped yesterday ({hits_20s} hits). They are running violently hot. Ride the momentum!)*")
-                    else:
-                        st.error(f"🔴 **20s INACTIVE** ({hits_20s} hits yesterday. Requires 2 or more.)")
 
-                    # --- THE "WALK AWAY" CHECK ---
-                    if not play_40s and not play_20s:
-                        st.warning("🛑 **NO TRIGGERS MET.** Do not play the Trios today. Keep your R20 in your pocket.")
+# ---------------------------
+# DATA LOADING + PARSING
+# ---------------------------
+def read_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(uploaded)
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded)
+    raise ValueError("Please upload an .xlsx, .xls, or .csv file.")
 
-                    # --- DISPLAY PLAYABLE TICKETS ---
-                    if play_40s or play_20s:
-                        st.divider()
-                        st.subheader("🎟️ Your Action Plan for Tonight")
-                        
-                        if play_40s:
-                            st.write("### Play these 20 High-40s Trios (Cost: R20 | Win: R500+)")
-                            c1, c2, c3, c4 = st.columns(4)
-                            for i, t in enumerate(trios_40s): 
-                                [c1, c2, c3, c4][i % 4].write(f"**{t[0]} - {t[1]} - {t[2]}**")
-                                
-                        if play_20s:
-                            st.write("### Play these 20 Elite-20s Trios (Cost: R20 | Win: R500+)")
-                            c1, c2, c3, c4 = st.columns(4)
-                            for i, t in enumerate(trios_20s): 
-                                [c1, c2, c3, c4][i % 4].write(f"**{t[0]} - {t[1]} - {t[2]}**")
 
-                else:
-                    st.warning("Please enter exactly 7 numbers.")
+def detect_main_number_columns(df: pd.DataFrame) -> List[str]:
+    """
+    Detect 6 main-number columns.
+    Supports:
+      - N1..N6, Num1..Num6
+      - Otherwise: first 6 columns that are mostly numeric
+    """
+    cols = list(df.columns)
+    lower = [str(c).strip().lower() for c in cols]
 
-            except ValueError:
-                st.error("Invalid input. Please use spaces or commas to separate your numbers.")
+    # Prefer explicit names
+    preferred_sets = [
+        ["n1", "n2", "n3", "n4", "n5", "n6"],
+        ["num1", "num2", "num3", "num4", "num5", "num6"],
+    ]
+    for pref in preferred_sets:
+        match = []
+        for p in pref:
+            if p in lower:
+                match.append(cols[lower.index(p)])
+        if len(match) == 6:
+            return match
 
-if __name__ == "__main__":
-    run_strategy_hub_app()
+    # Fallback: first 6 mostly-numeric columns
+    numeric_candidates: List[str] = []
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().mean() >= 0.80:
+            numeric_candidates.append(c)
+
+    if len(numeric_candidates) < 6:
+        raise ValueError(
+            "Could not detect 6 main-number columns. "
+            "Ensure your file has 6 main numbers per row (e.g., N1..N6 or Num1..Num6)."
+        )
+
+    return numeric_candidates[:6]
+
+
+def parse_draws(df: pd.DataFrame) -> Tuple[List[List[int]], List[int], List[str]]:
+    """
+    Returns (all_draws, latest_draw, used_cols)
+    all_draws contains only valid rows with 6 integers.
+    """
+    use_cols = detect_main_number_columns(df)
+
+    draws: List[List[int]] = []
+    for _, row in df.iterrows():
+        try:
+            nums = [int(row[c]) for c in use_cols]
+            # basic sanity: within 1..49 (adjust if your game differs)
+            draws.append(nums)
+        except Exception:
+            continue
+
+    if not draws:
+        raise ValueError("No valid draw rows found after parsing. Check your file format.")
+
+    return draws, draws[-1], use_cols
+
+
+# ---------------------------
+# TRANSFORM: -5, +5, ±5
+# ---------------------------
+def transform_candidates(latest_draw: Sequence[int], mode: str, cfg: CompressionConfig) -> List[int]:
+    """
+    mode in {"-5", "+5", "+/-5"}.
+    """
+    out: Set[int] = set()
+    for n in latest_draw:
+        if mode in ("-5", "+/-5"):
+            m = n - 5
+            if cfg.min_num <= m <= cfg.max_num:
+                out.add(m)
+        if mode in ("+5", "+/-5"):
+            m = n + 5
+            if cfg.min_num <= m <= cfg.max_num:
+                out.add(m)
+    return sorted(out)
+
+
+# ---------------------------
+# COMPRESSION ENGINE (to duos)
+# ---------------------------
+def _freq_map(all_draws: Sequence[Sequence[int]]) -> Dict[int, int]:
+    freq: Dict[int, int] = {}
+    for d in all_draws:
+        for n in d:
+            freq[n] = freq.get(n, 0) + 1
+    return freq
+
+
+def _pick_anchors(candidates: List[int], freq: Dict[int, int]) -> Tuple[int, int]:
+    """
+    Pick 2 anchors:
+    - highest historical frequency
+    - second anchor chosen to maximize spread among top candidates
+    """
+    ranked = sorted(candidates, key=lambda x: (-freq.get(x, 0), x))
+    a1 = ranked[0]
+    pool = ranked[1:min(len(ranked), 7)] or ranked[1:]
+    a2 = max(pool, key=lambda x: (abs(x - a1), freq.get(x, 0), -x))
+    return a1, a2
+
+
+def _pick_stabilizers(
+    candidates: List[int],
+    anchors: Tuple[int, int],
+    freq: Dict[int, int],
+    prefer_spacing: int
+) -> Tuple[int, int]:
+    """
+    Choose 2 stabilizers:
+    - far from anchors (spread)
+    - decent frequency
+    - prefer spacing >= prefer_spacing between stabilizers
+    """
+    a1, a2 = anchors
+    remaining = [c for c in candidates if c not in anchors]
+
+    if len(remaining) == 0:
+        return a1, a2
+    if len(remaining) == 1:
+        return remaining[0], a1
+
+    def base_score(x: int) -> Tuple[int, int, int]:
+        spread = min(abs(x - a1), abs(x - a2))
+        return (spread, freq.get(x, 0), -x)
+
+    ranked = sorted(remaining, key=base_score, reverse=True)
+    s1 = ranked[0]
+
+    def s2_score(x: int) -> Tuple[int, int, int, int]:
+        spacing_ok = 1 if abs(x - s1) >= prefer_spacing else 0
+        return (spacing_ok, abs(x - s1), min(abs(x - a1), abs(x - a2)), freq.get(x, 0))
+
+    s2 = max(ranked[1:], key=s2_score)
+    return s1, s2
+
+
+def compress_to_duos(candidates: List[int], all_draws: Sequence[Sequence[int]], cfg: CompressionConfig) -> List[Tuple[int, int]]:
+    """
+    EXACTLY 4 duos design (default):
+      1) A1 & S1
+      2) A1 & S2
+      3) A1 & A2
+      4) S1 & A2
+    This concentrates coverage around strongest anchor while keeping a bridge.
+    """
+    if len(candidates) < 2:
+        return []
+
+    freq = _freq_map(all_draws)
+    a1, a2 = _pick_anchors(candidates, freq)
+    s1, s2 = _pick_stabilizers(candidates, (a1, a2), freq, cfg.prefer_spacing)
+
+    base = [
+        tuple(sorted((a1, s1))),
+        tuple(sorted((a1, s2))),
+        tuple(sorted((a1, a2))),
+        tuple(sorted((s1, a2))),
+    ]
+
+    # unique + valid
+    duos: List[Tuple[int, int]] = []
+    seen: Set[Tuple[int, int]] = set()
+    for d in base:
+        if d[0] == d[1]:
+            continue
+        if d not in seen:
+            seen.add(d)
+            duos.append(d)
+
+    # Ensure exact count (fill if needed)
+    if len(duos) < cfg.duos_count:
+        # add best remaining pairs by combined frequency + spread
+        existing = set(duos)
+
+        def duo_score(p: Tuple[int, int]) -> Tuple[int, int]:
+            x, y = p
+            return (freq.get(x, 0) + freq.get(y, 0), abs(x - y))
+
+        remaining_pairs: List[Tuple[int, int]] = []
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                p = tuple(sorted((candidates[i], candidates[j])))
+                if p not in existing:
+                    remaining_pairs.append(p)
+
+        remaining_pairs.sort(key=duo_score, reverse=True)
+        for p in remaining_pairs:
+            if len(duos) >= cfg.duos_count:
+                break
+            duos.append(p)
+
+    return duos[:cfg.duos_count]
+
+
+# ---------------------------
+# STREAMLIT UI (drop-in)
+# ---------------------------
+def render_duo_compression_ui() -> None:
+    st.subheader("🎯 Duo Compression (Guided Randomness)")
+
+    uploaded = st.file_uploader("Upload historical draws (.xlsx / .csv)", type=["xlsx", "xls", "csv"])
+    if not uploaded:
+        st.info("Upload your file to generate compressed duos.")
+        return
+
+    mode = st.selectbox("Transform rule", ["-5", "+5", "+/-5"], index=0)
+    duos_count = st.number_input("How many duos?", min_value=2, max_value=12, value=4, step=1)
+    prefer_spacing = st.slider("Prefer stabilizer spacing", 3, 12, 5, 1)
+
+    cfg = CompressionConfig(duos_count=int(duos_count), prefer_spacing=int(prefer_spacing))
+
+    try:
+        df = read_uploaded_file(uploaded)
+        draws, latest_draw, used_cols = parse_draws(df)
+
+        st.caption(f"Detected main-number columns: {', '.join(map(str, used_cols))}")
+        st.write("Latest draw:", latest_draw)
+
+        candidates = transform_candidates(latest_draw, mode=mode, cfg=cfg)
+        st.write(f"Candidate set ({mode}):", candidates)
+
+        if len(candidates) < 2:
+            st.warning("Not enough candidates to form duos. Try +5 or +/-5.")
+            return
+
+        duos = compress_to_duos(candidates, draws, cfg)
+
+        st.markdown("### ✅ Compressed duos")
+        for i, (a, b) in enumerate(duos, start=1):
+            st.markdown(f"**{i}. {a} & {b}**")
+
+    except Exception as e:
+        st.error(str(e))
+
+
+# If you want it to run immediately when pasted into app.py:
+# render_duo_compression_ui()
