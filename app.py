@@ -1,222 +1,172 @@
-import streamlit as st
-import pandas as pd
+# ============================================================
+# PHASE DETECTOR (Drop-in for your Streamlit)
+# Detects 3 phases from bonus-ball direction:
+#   1) OSCILLATION  -> frequent reversals, no sustained trend
+#   2) EXPANSION    -> sustained same-direction moves, large steps
+#   3) COMPRESSION  -> after big expansion, pullback toward center
+#
+# Works on the last N bonus balls (default 20).
+# Outputs:
+# - Phase label
+# - Key metrics
+# - Suggested directional bias for the NEXT move
+# ============================================================
+
 import numpy as np
+import streamlit as st
 
-st.set_page_config(page_title="Bonus Directional Backtest", layout="centered")
-st.title("🎯 Bonus Directional Backtest (Shock → Exhaustion → Reversal)")
+def phase_detector(bonus_series, window=20, strong_thresh=10, center=25):
+    """
+    bonus_series: list[int] in chronological order (oldest -> newest)
+    window: how many latest bonuses to analyze
+    strong_thresh: |delta| > strong_thresh considered a strong move
+    center: mean-centering target (for 1..49, ~25 is natural)
+    """
+    if len(bonus_series) < 6:
+        return {"phase": "INSUFFICIENT_DATA", "reason": "Need at least 6 bonus values."}
 
-# -----------------------------
-# Upload
-# -----------------------------
-uploaded = st.file_uploader("Upload your Excel/CSV sheet", type=["xlsx", "xls", "csv"])
-if not uploaded:
-    st.info("Upload your sheet to run the backtest.")
-    st.stop()
+    seq = bonus_series[-window:] if len(bonus_series) >= window else bonus_series[:]
+    deltas = np.diff(seq)
+    mags = np.abs(deltas)
+    signs = np.sign(deltas)
 
-# -----------------------------
-# Load file
-# -----------------------------
-name = uploaded.name.lower()
-if name.endswith(("xlsx", "xls")):
-    df = pd.read_excel(uploaded)
-else:
-    df = pd.read_csv(uploaded)
+    # Remove zeros for direction logic
+    nonzero = signs[signs != 0]
+    if len(nonzero) < 3:
+        return {"phase": "FLAT/NOISY", "reason": "Too many zero changes."}
 
-# -----------------------------
-# Detect Bonus column
-# -----------------------------
-def detect_bonus_col(df: pd.DataFrame):
-    # strict matches
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if cl in ("bonus", "bb", "bonusball", "bonus_ball", "bonus ball"):
-            return c
-    # soft match
-    for c in df.columns:
-        if "bonus" in str(c).strip().lower():
-            return c
-    return None
+    # Reversal rate
+    rev = 0
+    cont = 0
+    for i in range(len(nonzero) - 1):
+        if nonzero[i] != nonzero[i + 1]:
+            rev += 1
+        else:
+            cont += 1
+    reversal_rate = rev / (rev + cont) if (rev + cont) else 0
 
-bonus_col = detect_bonus_col(df)
-if not bonus_col:
-    st.error("Could not find a Bonus column. Rename it to 'Bonus' (recommended).")
-    st.stop()
+    # Strong move rate
+    strong_mask = mags > strong_thresh
+    strong_rate = strong_mask.mean() if len(mags) else 0
 
-# -----------------------------
-# Optional Date sort (if present)
-# -----------------------------
-def detect_date_col(df: pd.DataFrame):
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if cl in ("date", "draw_date", "drawdate"):
-            return c
-    for c in df.columns:
-        if "date" in str(c).strip().lower():
-            return c
-    return None
+    # Same-direction run length near the end (trend strength)
+    # Count how many last consecutive signs are the same
+    last_sign = signs[-1] if signs[-1] != 0 else (nonzero[-1] if len(nonzero) else 0)
+    run_len = 1
+    for i in range(len(signs) - 2, -1, -1):
+        if signs[i] == 0:
+            continue
+        if signs[i] == last_sign:
+            run_len += 1
+        else:
+            break
 
-date_col = detect_date_col(df)
-if date_col:
-    # try parse
-    try:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.sort_values(date_col).reset_index(drop=True)
-    except Exception:
-        pass
+    # Center distance behavior
+    # If we are far from center and last moves were in the outward direction, we call it expansion
+    # If we are far from center and last move was toward center, we call it compression
+    last_bonus = seq[-1]
+    dist_from_center = abs(last_bonus - center)
 
-# -----------------------------
-# Extract bonus series
-# -----------------------------
-bonus = pd.to_numeric(df[bonus_col], errors="coerce").dropna().astype(int).tolist()
-bonus = [b for b in bonus if 1 <= b <= 49]
+    # Determine whether last move moved away from center or toward center
+    prev_bonus = seq[-2]
+    prev_dist = abs(prev_bonus - center)
+    moved_away = dist_from_center > prev_dist
+    moved_toward = dist_from_center < prev_dist
 
-if len(bonus) < 25:
-    st.error("Not enough bonus history found (need at least ~25 values).")
-    st.stop()
+    # ---- Phase classification rules (simple, interpretable) ----
+    # OSCILLATION: high reversal rate
+    # EXPANSION: low reversal + strong moves + run_len>=2 + moved away from center
+    # COMPRESSION: after being far from center, moved toward center (often after expansion)
+    phase = "OSCILLATION"
 
-# -----------------------------
-# Controls
-# -----------------------------
-with st.expander("Model Settings", expanded=True):
-    strong_threshold = st.slider("Strong move threshold (|Δ| >)", 6, 25, 10, 1)
-    weak_threshold = st.slider("Weak move threshold (|Δ| ≤)", 1, 12, 6, 1)
-    alpha = st.slider("Bounce strength α (fraction of strong move)", 0.20, 0.90, 0.50, 0.05)
-    zone_half_width = st.slider("Zone half-width (±)", 1, 6, 2, 1)
+    if reversal_rate >= 0.60:
+        phase = "OSCILLATION"
+    else:
+        # not oscillating, check expansion vs compression
+        if run_len >= 2 and strong_rate >= 0.35 and moved_away and dist_from_center >= 10:
+            phase = "EXPANSION"
+        elif moved_toward and dist_from_center >= 6:
+            phase = "COMPRESSION"
+        else:
+            # neutral / mixed
+            phase = "MIXED"
 
-    st.caption("Trigger = Strong move, then Weak continuation in same direction. Prediction fires AFTER the weak continuation, for the NEXT bonus.")
+    # ---- Suggest next directional bias (not a prediction) ----
+    # Oscillation -> bias reversal
+    # Expansion -> bias pullback (toward center)
+    # Compression -> bias mild continuation toward center then stabilize
+    if phase == "OSCILLATION":
+        bias = "REVERSE_LAST_DIRECTION"
+    elif phase == "EXPANSION":
+        bias = "PULL_BACK_TOWARD_CENTER"
+    elif phase == "COMPRESSION":
+        bias = "CONTINUE_TOWARD_CENTER (MILD)"
+    else:
+        bias = "NO_STRONG_BIAS"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def sgn(x: int) -> int:
-    return 1 if x > 0 else (-1 if x < 0 else 0)
-
-def clamp(n: int, lo: int = 1, hi: int = 49) -> int:
-    return max(lo, min(hi, n))
-
-def make_zone(center: int, half: int) -> list:
-    z = list(range(center - half, center + half + 1))
-    z = [n for n in z if 1 <= n <= 49]
-    return z
-
-# -----------------------------
-# Backtest
-# -----------------------------
-# We need deltas between consecutive bonuses:
-# delta[i] = bonus[i] - bonus[i-1]  for i >= 1
-deltas = [bonus[i] - bonus[i - 1] for i in range(1, len(bonus))]
-
-signals = []
-hits = 0
-total = 0
-
-# Pattern uses two deltas:
-# strong_delta at i (between bonus[i] and bonus[i-1])
-# weak_delta at i+1 (between bonus[i+1] and bonus[i])
-# Prediction is for bonus[i+2] (next after weak continuation)
-#
-# Index mapping:
-# bonus index: 0..N-1
-# delta index: 0..N-2 corresponds to movement to bonus[k+1]
-#
-# We evaluate k such that:
-# strong_delta = deltas[k] (move to bonus[k+1])
-# weak_delta   = deltas[k+1] (move to bonus[k+2])
-# prediction targets bonus[k+3]
-for k in range(len(deltas) - 2):
-    strong_delta = deltas[k]
-    weak_delta = deltas[k + 1]
-
-    # Conditions:
-    # Strong move happened
-    if abs(strong_delta) <= strong_threshold:
-        continue
-    # Weak continuation happened (same direction, but weak)
-    if abs(weak_delta) > weak_threshold:
-        continue
-    if sgn(weak_delta) != sgn(strong_delta):  # must continue same direction
-        continue
-
-    # We fire prediction at time of bonus[k+2] (current)
-    current_bonus = bonus[k + 2]
-    next_actual = bonus[k + 3]
-
-    # Reversal projection:
-    bounce = int(round(alpha * abs(strong_delta)))
-    bounce = max(1, bounce)  # ensure at least 1 step
-    projected = current_bonus + (-sgn(strong_delta) * bounce)
-    projected = clamp(projected)
-
-    zone = make_zone(projected, zone_half_width)
-
-    hit = next_actual in zone
-    total += 1
-    hits += int(hit)
-
-    signals.append({
-        "Index": k,
-        "Bonus(k)": bonus[k],
-        "Bonus(k+1)": bonus[k+1],
-        "Bonus(k+2) [current]": current_bonus,
-        "Strong Δ": strong_delta,
-        "Weak Δ": weak_delta,
-        "Projected": projected,
-        "Zone": ", ".join(map(str, zone)),
-        "Actual next (k+3)": next_actual,
-        "Hit": "✅" if hit else "—",
-    })
+    return {
+        "phase": phase,
+        "reversal_rate": round(reversal_rate, 3),
+        "strong_rate": round(float(strong_rate), 3),
+        "run_len_same_direction_end": int(run_len),
+        "last_bonus": int(last_bonus),
+        "last_delta": int(deltas[-1]),
+        "dist_from_center": float(dist_from_center),
+        "moved_away_from_center": bool(moved_away),
+        "moved_toward_center": bool(moved_toward),
+        "bias": bias,
+        "window_used": len(seq),
+        "strong_thresh": strong_thresh,
+        "center": center,
+    }
 
 # -----------------------------
-# Results
+# Streamlit usage example
 # -----------------------------
-zone_size = 2 * zone_half_width + 1
-baseline = zone_size / 49
+# Assuming you already have df loaded and a 'Bonus' column
+# bonuses = df["Bonus"].dropna().astype(int).tolist()
 
-st.subheader("📊 Backtest Results")
-if total == 0:
-    st.warning("No triggers found with current thresholds. Try lowering Strong threshold or increasing Weak threshold.")
-else:
-    hit_rate = hits / total
-    st.write(f"Triggers found: **{total}**")
-    st.write(f"Hits (actual next bonus inside zone): **{hits}**")
-    st.write(f"Hit rate: **{hit_rate:.2%}**")
-    st.write(f"Random baseline for a {zone_size}-number zone: **{baseline:.2%}**")
+st.subheader("🧭 Bonus Phase Detector")
 
-    lift = (hit_rate / baseline) if baseline > 0 else 0
-    st.write(f"Lift vs random: **{lift:.2f}×**")
+window = st.slider("Phase window (bonuses)", 10, 60, 20, 1)
+strong_thresh = st.slider("Strong move threshold (|delta| > x)", 5, 20, 10, 1)
+center = st.slider("Center target (1–49 midpoint)", 15, 35, 25, 1)
 
-st.divider()
+bonuses = df["Bonus"].dropna().astype(int).tolist()
+res = phase_detector(bonuses, window=window, strong_thresh=strong_thresh, center=center)
 
-st.subheader("🧾 Latest Trigger Signals (most recent first)")
-if signals:
-    sig_df = pd.DataFrame(signals).iloc[::-1].reset_index(drop=True)
-    st.dataframe(sig_df.head(25), use_container_width=True)
-else:
-    st.info("No signals to display for current settings.")
+st.write(res)
 
-# -----------------------------
-# Live next prediction (from the last available pattern)
-# -----------------------------
-st.subheader("🔮 Next Bonus Zone (if last two moves match the pattern)")
-# Check the last two deltas:
-last_strong = deltas[-2]  # second last move
-last_weak = deltas[-1]    # last move
-current_bonus = bonus[-1]
+# Optional: simple next-step candidate zone guidance
+if res.get("phase") in ("OSCILLATION", "EXPANSION", "COMPRESSION"):
+    last = res["last_bonus"]
+    last_delta = res["last_delta"]
+    st.markdown("### Next-step guidance (zone)")
 
-st.write(f"Last moves: strong candidate Δ={last_strong}, last Δ={last_weak}, current bonus={current_bonus}")
+    if res["bias"] == "REVERSE_LAST_DIRECTION":
+        # reverse last move, use similar magnitude bucket
+        mag = abs(last_delta)
+        mag = max(6, min(15, mag))  # clamp to a realistic band
+        if last_delta > 0:
+            lo, hi = max(1, last - mag - 3), max(1, last - mag + 3)
+        else:
+            lo, hi = min(49, last + mag - 3), min(49, last + mag + 3)
+        st.write(f"Bias: reverse. Suggested zone ≈ {lo} to {hi}")
 
-fires = (
-    abs(last_strong) > strong_threshold and
-    abs(last_weak) <= weak_threshold and
-    sgn(last_weak) == sgn(last_strong) and
-    sgn(last_strong) != 0
-)
+    elif res["bias"] == "PULL_BACK_TOWARD_CENTER":
+        # pull toward center by 8-18
+        step = 12
+        if last > center:
+            lo, hi = max(1, last - (step + 6)), max(1, last - (step - 6))
+        else:
+            lo, hi = min(49, last + (step - 6)), min(49, last + (step + 6))
+        st.write(f"Bias: pullback toward center. Suggested zone ≈ {lo} to {hi}")
 
-if not fires:
-    st.warning("Pattern NOT active right now (no prediction fired).")
-else:
-    bounce = int(round(alpha * abs(last_strong)))
-    bounce = max(1, bounce)
-    projected = clamp(current_bonus + (-sgn(last_strong) * bounce))
-    zone = make_zone(projected, zone_half_width)
-    st.success(f"Pattern ACTIVE ✅  Projected={projected}  Zone={zone}")
+    elif res["bias"].startswith("CONTINUE_TOWARD_CENTER"):
+        # continue mild toward center by 5-12
+        step = 8
+        if last > center:
+            lo, hi = max(1, last - (step + 4)), max(1, last - (step - 4))
+        else:
+            lo, hi = min(49, last + (step - 4)), min(49, last + (step + 4))
+        st.write(f"Bias: mild continuation toward center. Suggested zone ≈ {lo} to {hi}")
