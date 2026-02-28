@@ -1,56 +1,78 @@
 # app.py
-# ------------------------------------------------------------
-# Band-Balanced + Gap-Pressure (Rolling Window) Duo Generator
-# Methods used to generate the locked 4 duos:
-# 1) Optional: filter to Lunchtime draws if a suitable column exists
-# 2) Rolling gap overlay (default last 20 draws): pick 1 "re-entry" anchor per band
-#    Bands: 1–9, 10–19, 20–29, 30–39, 40–49
-#    Re-entry anchor = number in band with the longest absence in the rolling window
-#    (tie-break by historical frequency, then spread)
-# 3) Build EXACT 4 duos (band-balanced):
-#    - (20–29 anchor) & (1–9 anchor)
-#    - (20–29 anchor) & (30–39 anchor)
-#    - (10–19 anchor) & (30–39 anchor)
-#    - (20–29 anchor) & (40–49 anchor)
-# ------------------------------------------------------------
+# ============================================================
+# Band-Balanced Duo Engine (Rolling-20 Gap Overlay) + Replay Winner
+# - Upload Excel/CSV historical draws
+# - Uses MAIN 6 numbers only (bonus excluded by default)
+# - Builds 5 band anchors using "last 20 draws" gap logic (Method B)
+# - Generates EXACT 4 duos using fixed band-balanced template
+# - Includes:
+#   ✅ Sheet fingerprint (prove file didn't change)
+#   🔁 Replay Winner Anchors toggle
+#   🏆 Save current anchors as Winner button
+# ============================================================
 
 from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
-from typing import List, Tuple, Dict, Optional
+import hashlib
 from collections import Counter
+from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
+import streamlit as st
+
+# ----------------------------
+# PAGE
+# ----------------------------
 st.set_page_config(page_title="Band-Balanced Duo Engine", layout="centered")
-st.title("🎯 Band-Balanced Duo Engine (Gap Overlay)")
+st.title("🎯 Band-Balanced Duo Engine")
+st.caption("Rolling-20 Gap Anchors (B) + Replay Winner + Fixed 4-Duo Template")
 
-# -----------------------------
-# Helpers: file load
-# -----------------------------
-def load_file(uploaded) -> pd.DataFrame:
-    name = uploaded.name.lower()
+# ----------------------------
+# SETTINGS
+# ----------------------------
+with st.expander("Settings", expanded=True):
+    WINDOW = st.slider("Rolling gap window (draws)", 10, 60, 20, 1)
+    EXCLUDE_LATEST = st.toggle("Exclude latest draw numbers when picking anchors", value=True)
+    INCLUDE_BONUS = st.toggle("Include bonus in calculations (optional)", value=False)
+
+# ----------------------------
+# BANDS
+# ----------------------------
+BANDS: Dict[str, Tuple[int, int]] = {
+    "1–9": (1, 9),
+    "10–19": (10, 19),
+    "20–29": (20, 29),
+    "30–39": (30, 39),
+    "40–49": (40, 49),
+}
+
+# ----------------------------
+# FILE UPLOAD
+# ----------------------------
+uploaded = st.file_uploader("Upload historical draws (.xlsx/.csv)", type=["xlsx", "xls", "csv"])
+
+def load_file(up) -> pd.DataFrame:
+    name = up.name.lower()
     if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded)
+        return pd.read_excel(up)
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded)
-    raise ValueError("Upload .xlsx, .xls, or .csv")
+        return pd.read_csv(up)
+    raise ValueError("Please upload an Excel (.xlsx/.xls) or CSV (.csv) file.")
 
-# -----------------------------
-# Helpers: detect draw columns
-# -----------------------------
 def detect_main_cols(df: pd.DataFrame) -> List[str]:
     """
-    Detect 6 main number columns.
-    Prefers N1..N6 or Num1..Num6 else first 6 mostly-numeric columns.
+    Detect the 6 main-number columns.
+    Preferred headers: N1..N6 or Num1..Num6
+    Fallback: first 6 columns that are mostly numeric.
     """
     cols = list(df.columns)
     low = [str(c).strip().lower() for c in cols]
 
-    preferred = [
-        ["n1","n2","n3","n4","n5","n6"],
-        ["num1","num2","num3","num4","num5","num6"],
+    preferred_sets = [
+        ["n1", "n2", "n3", "n4", "n5", "n6"],
+        ["num1", "num2", "num3", "num4", "num5", "num6"],
     ]
-    for pref in preferred:
+    for pref in preferred_sets:
         if all(p in low for p in pref):
             return [cols[low.index(p)] for p in pref]
 
@@ -63,63 +85,42 @@ def detect_main_cols(df: pd.DataFrame) -> List[str]:
     if len(numeric_candidates) < 6:
         raise ValueError(
             "Could not detect 6 main-number columns. "
-            "Rename headers to N1..N6 (recommended) or ensure first 6 columns are numeric."
+            "Rename your headers to N1..N6 (recommended) or ensure you have 6 numeric columns."
         )
     return numeric_candidates[:6]
 
-def detect_lunchtime_col(df: pd.DataFrame) -> Optional[str]:
+def detect_bonus_col(df: pd.DataFrame) -> Optional[str]:
     """
-    Try to find a column that indicates draw session/type/time, e.g. 'Lunchtime'/'Teatime'.
-    We'll look for common names.
+    Optional: try to find a bonus column.
+    Common names: Bonus, BB, bonus_ball
     """
-    candidates = ["drawtype", "draw_type", "session", "time", "draw time", "draw_time", "game", "type"]
-    low_map = {str(c).strip().lower(): c for c in df.columns}
-    for k in candidates:
-        if k in low_map:
-            return low_map[k]
-    # also try any column containing these tokens
     for c in df.columns:
         cl = str(c).strip().lower()
-        if any(tok in cl for tok in ["lunch", "tea", "session", "drawtype", "draw type", "draw_time", "draw time"]):
+        if cl in ("bonus", "bb", "bonusball", "bonus_ball", "bonus ball"):
+            return c
+    # fallback: any column containing 'bonus'
+    for c in df.columns:
+        if "bonus" in str(c).strip().lower():
             return c
     return None
 
-def parse_draws(df: pd.DataFrame, main_cols: List[str]) -> List[List[int]]:
+def parse_draws(df: pd.DataFrame, main_cols: List[str], bonus_col: Optional[str], include_bonus: bool) -> List[List[int]]:
     draws: List[List[int]] = []
     for _, row in df.iterrows():
         try:
             nums = [int(row[c]) for c in main_cols]
+            if include_bonus and bonus_col is not None:
+                nums.append(int(row[bonus_col]))
         except Exception:
             continue
-        # basic sanity
-        if len(nums) == 6 and all(1 <= n <= 49 for n in nums):
+
+        # Basic sanity: keep only values in 1..49
+        if all(1 <= n <= 49 for n in nums) and len(nums) in (6, 7):
             draws.append(nums)
+
     if not draws:
-        raise ValueError("No valid draws parsed. Check your file rows and number ranges.")
+        raise ValueError("No valid draws parsed. Check your file format and numeric columns.")
     return draws
-
-# -----------------------------
-# Band + scoring
-# -----------------------------
-BANDS: Dict[str, Tuple[int, int]] = {
-    "1–9": (1, 9),
-    "10–19": (10, 19),
-    "20–29": (20, 29),
-    "30–39": (30, 39),
-    "40–49": (40, 49),
-}
-
-def band_of(n: int) -> Optional[str]:
-    for name, (lo, hi) in BANDS.items():
-        if lo <= n <= hi:
-            return name
-    return None
-
-def historical_freq(draws: List[List[int]]) -> Counter:
-    cnt = Counter()
-    for d in draws:
-        cnt.update(d)
-    return cnt
 
 def rolling_gap_anchor(
     draws: List[List[int]],
@@ -130,39 +131,38 @@ def rolling_gap_anchor(
     exclude_recent_draw: Optional[List[int]] = None,
 ) -> int:
     """
-    Pick band anchor using rolling gap within last `window` draws:
-      gap(n) = number of draws since last occurrence inside window; if not seen in window -> gap = window+1
-    Choose max gap; tie-break by higher historical freq; then by larger spread to band center (optional).
+    Method B: Rolling window = last `window` draws.
+    For each number in band, gap = draws since last seen in window; if never seen => window+1.
+    Pick max gap; tie-break by overall frequency; then by closeness to band center.
     """
-    window_draws = draws[-window:] if len(draws) >= window else draws[:]
-    seen_last_index: Dict[int, int] = {}
-    # index 0..len(window_draws)-1
+    window_draws = draws[-window:] if len(draws) >= window else draws
+    last_seen: Dict[int, int] = {}
+
     for i, d in enumerate(window_draws):
         for n in d:
             if band_lo <= n <= band_hi:
-                seen_last_index[n] = i
+                last_seen[n] = i
 
     candidates = list(range(band_lo, band_hi + 1))
+
     if exclude_recent_draw:
-        exclude_set = set(exclude_recent_draw)
-        candidates = [n for n in candidates if n not in exclude_set] or candidates
+        ex = set(exclude_recent_draw)
+        filtered = [n for n in candidates if n not in ex]
+        if filtered:
+            candidates = filtered
 
     last_i = len(window_draws) - 1
+    center = (band_lo + band_hi) / 2
 
     def score(n: int):
-        if n in seen_last_index:
-            gap = last_i - seen_last_index[n]
-        else:
-            gap = window + 1
-        # tie-breakers: freq, then distance from band center
-        center = (band_lo + band_hi) / 2
-        return (gap, freq.get(n, 0), abs(n - center))
+        gap = (last_i - last_seen[n]) if n in last_seen else (window + 1)
+        return (gap, freq.get(n, 0), -abs(n - center))
 
     return max(candidates, key=score)
 
 def build_four_duos(anchors: Dict[str, int]) -> List[Tuple[int, int]]:
     """
-    EXACT 4 duos as per method:
+    EXACT 4 duos (fixed template):
       1) (20–29) & (1–9)
       2) (20–29) & (30–39)
       3) (10–19) & (30–39)
@@ -180,83 +180,114 @@ def build_four_duos(anchors: Dict[str, int]) -> List[Tuple[int, int]]:
         tuple(sorted((a10, a30))),
         tuple(sorted((a20, a40))),
     ]
-    # ensure uniqueness while preserving order
-    out, seen = [], set()
+
+    # unique, ordered
+    out: List[Tuple[int, int]] = []
+    seen = set()
     for d in duos:
-        if d[0] == d[1]:
-            continue
-        if d not in seen:
+        if d[0] != d[1] and d not in seen:
             seen.add(d)
             out.append(d)
     return out
 
-# -----------------------------
-# UI
-# -----------------------------
-uploaded = st.file_uploader("Upload historical draws (.xlsx / .csv)", type=["xlsx", "xls", "csv"])
+# ----------------------------
+# SESSION STATE: WINNER ANCHORS
+# ----------------------------
+if "winner_anchors" not in st.session_state:
+    st.session_state.winner_anchors = None
 
-with st.expander("Settings", expanded=True):
-    window = st.slider("Rolling gap window (draws)", 10, 60, 20, 1)
-    exclude_last_draw = st.toggle("Exclude numbers from the latest draw when picking anchors", value=True)
-    prefer_lunchtime = st.toggle("Filter to Lunchtime (if column exists)", value=True)
-
+# ----------------------------
+# MAIN RUN
+# ----------------------------
 if not uploaded:
-    st.info("Upload your file to generate the 4 duos.")
+    st.info("Upload your historical draw file to generate anchors + 4 duos.")
     st.stop()
 
 try:
     df = load_file(uploaded)
     main_cols = detect_main_cols(df)
-    st.caption(f"Detected main columns: {', '.join(map(str, main_cols))}")
+    bonus_col = detect_bonus_col(df)
 
-    # Optional Lunchtime filtering
-    lunch_col = detect_lunchtime_col(df)
+    # Use full df (no lunchtime filter unless you add one)
     df_use = df.copy()
 
-    if prefer_lunchtime and lunch_col:
-        # Keep rows where lunch_col contains 'lunch'
-        s = df_use[lunch_col].astype(str).str.lower()
-        df_lunch = df_use[s.str.contains("lunch", na=False)]
-        if len(df_lunch) >= 30:  # only apply if we still have enough history
-            df_use = df_lunch
-            st.caption(f"Filtered to Lunchtime using column: {lunch_col}")
-        else:
-            st.caption(f"Lunchtime filter found column '{lunch_col}', but not enough rows after filtering; using full dataset.")
+    # Fingerprint to prove file unchanged
+    try:
+        raw = df_use.to_csv(index=False).encode("utf-8")
+        st.caption(f"📌 Sheet fingerprint (MD5): {hashlib.md5(raw).hexdigest()}")
+    except Exception:
+        st.caption("📌 Sheet fingerprint unavailable (could not serialize).")
 
-    draws = parse_draws(df_use, main_cols)
-    freq = historical_freq(draws)
+    st.caption(f"Detected main columns: {', '.join(map(str, main_cols))}")
+    if INCLUDE_BONUS and bonus_col:
+        st.caption(f"Bonus column detected: {bonus_col} (included in calculations)")
+    elif INCLUDE_BONUS and not bonus_col:
+        st.warning("Bonus include is ON but no bonus column was detected. Using main 6 only.")
+        INCLUDE_BONUS = False
 
-    latest = draws[-1]
-    st.write("Latest draw detected:", latest)
+    draws = parse_draws(df_use, main_cols, bonus_col, INCLUDE_BONUS)
 
-    exclude = latest if exclude_last_draw else None
+    latest_draw = draws[-1]
+    # If bonus included, latest_draw may have 7 values; exclude_latest should exclude all of them
+    st.write("Latest draw detected:", latest_draw)
 
-    # Build band anchors via rolling gap overlay
-    anchors: Dict[str, int] = {}
-    for band_name, (lo, hi) in BANDS.items():
-        anchors[band_name] = rolling_gap_anchor(
-            draws=draws,
-            band_lo=lo,
-            band_hi=hi,
-            window=window,
-            freq=freq,
-            exclude_recent_draw=exclude,
+    # Frequency map (over all numbers included)
+    freq = Counter()
+    for d in draws:
+        freq.update(d)
+
+    # Replay + Save controls
+    col1, col2 = st.columns(2)
+    with col1:
+        replay_mode = st.toggle(
+            "🔁 Replay Winner Anchors",
+            value=False,
+            help="ON = use saved winner anchors exactly. OFF = compute anchors from rolling window."
+        )
+    with col2:
+        save_winner = st.button(
+            "🏆 Save current anchors as Winner",
+            help="Saves the currently computed anchors so you can replay them later."
         )
 
-    st.subheader("Band anchors (gap overlay)")
-    st.write(anchors)
+    # Compute anchors
+    exclude = latest_draw if EXCLUDE_LATEST else None
 
-    # Build EXACT 4 duos from the method
-    duos = build_four_duos(anchors)
+    anchors: Optional[Dict[str, int]] = None
 
-    st.subheader("✅ Locked 4 Duos (Band-balanced + Gap overlay)")
-    for i, (a, b) in enumerate(duos, start=1):
-        st.markdown(f"**{i}. {a} & {b}**")
+    if replay_mode:
+        if st.session_state.winner_anchors is None:
+            st.warning("No winner anchors saved yet. Turn off Replay, compute anchors, then press Save.")
+        else:
+            anchors = st.session_state.winner_anchors
+    else:
+        anchors = {}
+        for band_name, (lo, hi) in BANDS.items():
+            anchors[band_name] = rolling_gap_anchor(
+                draws=draws,
+                band_lo=lo,
+                band_hi=hi,
+                window=WINDOW,
+                freq=freq,
+                exclude_recent_draw=exclude,
+            )
+        if save_winner:
+            st.session_state.winner_anchors = anchors.copy()
+            st.success(f"Winner anchors saved: {st.session_state.winner_anchors}")
 
-    st.caption(
-        "Method: rolling-gap anchors per band (window), then fixed 4-duo template "
-        "(20–29 paired with 1–9, 30–39, 40–49; plus 10–19 with 30–39)."
-    )
+    if anchors:
+        st.subheader("Band anchors in use")
+        st.write(anchors)
+
+        duos = build_four_duos(anchors)
+        st.subheader("✅ Locked 4 Duos")
+        for i, (a, b) in enumerate(duos, start=1):
+            st.markdown(f"**{i}. {a} & {b}**")
+
+        st.caption(
+            "Algorithm: Rolling-window gap anchors per band (window size above), "
+            "optional exclusion of latest draw, then fixed 4-duo template."
+        )
 
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Error: {e}")
