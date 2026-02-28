@@ -132,7 +132,18 @@ window = st.slider("Phase window (bonuses)", 10, 60, 20, 1)
 strong_thresh = st.slider("Strong move threshold (|delta| > x)", 5, 20, 10, 1)
 center = st.slider("Center target (1–49 midpoint)", 15, 35, 25, 1)
 
-bonuses = df["Bonus"].dropna().astype(int).tolist()
+# Detect bonus column automatically
+bonus_col = None
+for c in df.columns:
+    if "bonus" in str(c).strip().lower():
+        bonus_col = c
+        break
+
+if bonus_col is None:
+    st.error("No bonus column found in file.")
+    st.stop()
+
+bonuses = df[bonus_col].dropna().astype(int).tolist()
 res = phase_detector(bonuses, window=window, strong_thresh=strong_thresh, center=center)
 
 st.write(res)
