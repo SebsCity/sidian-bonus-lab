@@ -1,14 +1,33 @@
+# app.py
+# ============================================================
+# Lunchtime Repeat Engine + 4-Duo Generator (Integrated)
+# - Upload Excel/CSV with historical draws (Date + N1..N6 + Bonus optional)
+# - Infers Lunchtime as FIRST row per date (or every 2nd row if no date column)
+# - Computes best REPEAT candidate from yesterday’s Lunchtime draw (historical conditional repeat rate)
+# - Computes 5 band anchors using Rolling WINDOW gap (Method B) from Lunchtime-only history
+# - Generates 4 locked duos (template) and injects repeat candidate into the duo set:
+#     - If repeat candidate already appears in the 4 duos -> keep as-is
+#     - Else replace the LOW-band anchor duo (a20 & a1) with (a20 & repeat_candidate)
+#       (keeps the hub stable while forcing the repeat candidate into the pack)
+#
+# Dependencies: streamlit, pandas, numpy, openpyxl
+# ============================================================
+
+from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+from collections import Counter
+from typing import List, Optional, Tuple, Dict
 
-st.set_page_config(page_title="Bonus Generator", layout="centered")
-st.title("🎯 Bonus Generator (Directional + Phase)")
-st.caption("Upload your historical sheet and generate ranked possible next bonus balls.")
+st.set_page_config(page_title="Repeat + Duo Engine", layout="centered")
+st.title("🔁🎯 Repeat + Duo Engine (Lunchtime Only)")
+st.caption("Repeat engineering + Rolling-gap anchors + 4 locked duos (integrated). No guarantees.")
 
-# ----------------------------
-# Load file
-# ----------------------------
+# -----------------------------
+# File loading
+# -----------------------------
 def load_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
     if name.endswith((".xlsx", ".xls")):
@@ -17,231 +36,335 @@ def load_file(uploaded) -> pd.DataFrame:
         return pd.read_csv(uploaded)
     raise ValueError("Upload .xlsx/.xls or .csv")
 
-def detect_bonus_col(df: pd.DataFrame) -> str:
+def detect_date_col(df: pd.DataFrame) -> Optional[str]:
     for c in df.columns:
-        if "bonus" in str(c).strip().lower():
+        if "date" in str(c).strip().lower():
             return c
-    raise ValueError("No bonus column found. Ensure a header contains the word 'bonus'.")
+    return None
 
-def safe_bonus_list(series: pd.Series) -> list[int]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    s = s[(s >= 1) & (s <= 49)]
-    return s.astype(int).tolist()
+def detect_main_cols(df: pd.DataFrame) -> List[str]:
+    cols = list(df.columns)
+    low = [str(c).strip().lower() for c in cols]
 
-# ----------------------------
-# Phase detector (simple + interpretable)
-# ----------------------------
-def phase_detector(bonuses: list[int], window=20, strong_thresh=10, center=25) -> dict:
-    if len(bonuses) < 8:
-        return {"phase": "INSUFFICIENT_DATA", "bias": "NONE"}
+    preferred_sets = [
+        ["n1", "n2", "n3", "n4", "n5", "n6"],
+        ["num1", "num2", "num3", "num4", "num5", "num6"],
+    ]
+    for pref in preferred_sets:
+        if all(p in low for p in pref):
+            return [cols[low.index(p)] for p in pref]
 
-    seq = bonuses[-window:] if len(bonuses) >= window else bonuses[:]
-    deltas = np.diff(seq)
-    mags = np.abs(deltas)
-    signs = np.sign(deltas)
-    nz = signs[signs != 0]
+    numeric_candidates = []
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().mean() >= 0.80:
+            numeric_candidates.append(c)
 
-    if len(nz) < 3:
-        return {"phase": "FLAT/NOISY", "bias": "NONE"}
+    if len(numeric_candidates) < 6:
+        raise ValueError(
+            "Could not detect 6 main-number columns. Rename headers to N1..N6 (recommended) "
+            "or ensure 6 numeric columns exist."
+        )
+    return numeric_candidates[:6]
 
-    # reversal rate
-    rev = 0
-    cont = 0
-    for i in range(len(nz) - 1):
-        if nz[i] != nz[i + 1]:
-            rev += 1
-        else:
-            cont += 1
-    reversal_rate = rev / (rev + cont) if (rev + cont) else 0
+def to_draw_list(df: pd.DataFrame, main_cols: List[str]) -> List[List[int]]:
+    draws = []
+    for _, row in df.iterrows():
+        nums = pd.to_numeric(row[main_cols], errors="coerce").dropna().astype(int).tolist()
+        if len(nums) == 6 and all(1 <= n <= 49 for n in nums):
+            draws.append(nums)
+    if not draws:
+        raise ValueError("No valid 6-number draws found after parsing.")
+    return draws
 
-    # strong move rate
-    strong_rate = float((mags > strong_thresh).mean()) if len(mags) else 0.0
+# -----------------------------
+# Lunchtime-only extraction
+# -----------------------------
+def lunchtime_only(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
+    dfx = df.copy()
 
-    last = seq[-1]
-    prev = seq[-2]
-    dist = abs(last - center)
-    prev_dist = abs(prev - center)
-    moved_away = dist > prev_dist
-    moved_toward = dist < prev_dist
+    if date_col is None:
+        # No date column: assume two draws per day in file order
+        return dfx.iloc[::2].reset_index(drop=True)
 
-    # run length at end (same direction)
-    last_sign = nz[-1]
-    run_len = 1
-    for i in range(len(signs) - 2, -1, -1):
-        if signs[i] == 0:
-            continue
-        if signs[i] == last_sign:
-            run_len += 1
-        else:
-            break
+    dfx[date_col] = pd.to_datetime(dfx[date_col], errors="coerce")
+    dfx = dfx.dropna(subset=[date_col]).copy()
+    dfx["_row_order"] = np.arange(len(dfx))
+    dfx = dfx.sort_values([date_col, "_row_order"], ascending=[True, True])
 
-    if reversal_rate >= 0.60:
-        phase = "OSCILLATION"
-        bias = "REVERSE"
-    else:
-        if run_len >= 2 and strong_rate >= 0.35 and moved_away and dist >= 10:
-            phase = "EXPANSION"
-            bias = "PULL_TO_CENTER"
-        elif moved_toward and dist >= 6:
-            phase = "COMPRESSION"
-            bias = "MILD_TO_CENTER"
-        else:
-            phase = "MIXED"
-            bias = "NONE"
+    lunch = dfx.groupby(date_col, as_index=False).head(1).copy()
+    lunch = lunch.drop(columns=["_row_order"])
+    return lunch.reset_index(drop=True)
+
+# -----------------------------
+# Repeat stats
+# -----------------------------
+def compute_repeat_stats(lunch_draws: List[List[int]]) -> Dict:
+    if len(lunch_draws) < 3:
+        raise ValueError("Need at least 3 Lunchtime draws to analyze repeats.")
+
+    repeat_counts = []
+    appeared_as_prev = Counter()
+    repeated_next = Counter()
+    last_repeat_idx = {}
+
+    for i in range(len(lunch_draws) - 1):
+        prev_set = set(lunch_draws[i])
+        next_set = set(lunch_draws[i + 1])
+        inter = prev_set.intersection(next_set)
+
+        repeat_counts.append(len(inter))
+
+        for n in prev_set:
+            appeared_as_prev[n] += 1
+        for n in inter:
+            repeated_next[n] += 1
+            last_repeat_idx[n] = i
 
     return {
-        "phase": phase,
-        "bias": bias,
-        "window_used": len(seq),
-        "last_bonus": int(last),
-        "last_delta": int(deltas[-1]) if len(deltas) else 0,
-        "reversal_rate": round(float(reversal_rate), 3),
-        "strong_rate": round(float(strong_rate), 3),
-        "run_len_end": int(run_len),
-        "center": int(center),
-        "strong_thresh": int(strong_thresh),
+        "repeat_counts": repeat_counts,
+        "repeat_dist": Counter(repeat_counts),
+        "appeared_as_prev": appeared_as_prev,
+        "repeated_next": repeated_next,
+        "last_repeat_idx": last_repeat_idx,
+        "num_transitions": len(repeat_counts),
     }
 
-# ----------------------------
-# Candidate generator (ranked)
-# ----------------------------
-def generate_candidates(
-    bonuses: list[int],
-    window=20,
-    strong_thresh=10,
-    center=25,
-    top_n=10,
-    exclude_recent_k=0,
-) -> tuple[list[tuple[int, float, str]], dict]:
-    """
-    Returns list of (number, score, explanation) sorted desc, plus phase dict.
-    Scoring combines:
-      - directional bias (phase-based)
-      - step-size likelihood from recent deltas
-      - digit preference from recent last digits
-      - mild mean-reversion toward center
-    """
-    seq = bonuses[-window:] if len(bonuses) >= window else bonuses[:]
-    last = seq[-1]
-    deltas = np.diff(seq)
-    abs_deltas = np.abs(deltas) if len(deltas) else np.array([1])
+def band_boost(n: int) -> float:
+    if 20 <= n <= 39:
+        return 0.20
+    if 10 <= n <= 19 or 40 <= n <= 49:
+        return 0.08
+    return 0.00
 
-    # phase
-    phase = phase_detector(bonuses, window=window, strong_thresh=strong_thresh, center=center)
-    bias = phase["bias"]
-    last_delta = phase.get("last_delta", 0)
+def rank_yesterday_repeats(
+    yesterday: List[int],
+    stats: Dict,
+    current_transition_index: int,
+    min_support: int = 25,
+) -> pd.DataFrame:
+    appeared = stats["appeared_as_prev"]
+    repeated = stats["repeated_next"]
+    last_rep = stats["last_repeat_idx"]
 
-    # step size histogram (recent)
-    # clamp steps to 1..25
-    steps = np.clip(abs_deltas.astype(int), 1, 25)
-    step_counts = np.bincount(steps, minlength=26)
-    step_probs = step_counts / step_counts.sum() if step_counts.sum() else np.ones(26) / 26
+    rows = []
+    for n in sorted(yesterday):
+        a = appeared.get(n, 0)
+        r = repeated.get(n, 0)
+        p = (r / a) if a > 0 else 0.0
 
-    # digit preference histogram (last digit)
-    digits = [b % 10 for b in seq]
-    dig_counts = np.bincount(digits, minlength=10)
-    dig_probs = dig_counts / dig_counts.sum() if dig_counts.sum() else np.ones(10) / 10
+        gap = (current_transition_index - last_rep[n]) if n in last_rep else (current_transition_index + 1)
+        recency_score = np.log1p(gap) / 5.0
 
-    # recent exclusions (optional)
-    recent_set = set(seq[-exclude_recent_k:]) if exclude_recent_k > 0 else set()
-
-    candidates = []
-    for x in range(1, 50):
-        if x in recent_set:
-            continue
+        support_factor = min(1.0, a / float(min_support))
 
         score = 0.0
-        reasons = []
+        score += 3.0 * p * support_factor
+        score += 0.6 * recency_score
+        score += band_boost(n)
 
-        # --- Directional bias ---
-        delta = x - last
-        ad = abs(delta)
-        dir_sign = np.sign(delta)
+        why = [f"P(repeat|present)={p:.3f} (support={a})", f"gap={gap}"]
+        if band_boost(n) > 0:
+            why.append("band boost")
 
-        if bias == "REVERSE":
-            # reverse last direction if last_delta != 0
-            if last_delta != 0 and dir_sign == -np.sign(last_delta):
-                score += 2.5
-                reasons.append("matches reversal bias")
-            elif last_delta == 0:
-                score += 0.5
-        elif bias == "PULL_TO_CENTER":
-            # reward moving toward center
-            moved_toward = abs(x - center) < abs(last - center)
-            if moved_toward:
-                score += 2.0
-                reasons.append("pulls toward center")
-        elif bias == "MILD_TO_CENTER":
-            moved_toward = abs(x - center) < abs(last - center)
-            if moved_toward:
-                score += 1.2
-                reasons.append("mild toward center")
+        rows.append({
+            "Number": n,
+            "Score": score,
+            "Why": "; ".join(why),
+            "Support(prev appearances)": a,
+            "Repeat hits": r,
+        })
 
-        # --- Step size likelihood ---
-        ad = int(np.clip(ad, 1, 25))
-        score += 1.6 * float(step_probs[ad])
-        reasons.append(f"step|Δ|={ad} favored")
+    return pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
 
-        # --- Digit preference ---
-        score += 0.9 * float(dig_probs[x % 10])
-        reasons.append(f"last-digit {x%10} seen often")
+# -----------------------------
+# Rolling-gap anchors (Method B) from Lunchtime-only history
+# -----------------------------
+BANDS: Dict[str, Tuple[int, int]] = {
+    "1–9": (1, 9),
+    "10–19": (10, 19),
+    "20–29": (20, 29),
+    "30–39": (30, 39),
+    "40–49": (40, 49),
+}
 
-        # --- Soft center preference (keep it realistic) ---
-        # prefer mid-zone a bit, but not too strong
-        score += 0.4 * (1.0 - (abs(x - center) / 24.0))
+def rolling_gap_anchor(
+    draws: List[List[int]],
+    band_lo: int,
+    band_hi: int,
+    window: int,
+    freq: Counter,
+    exclude_recent_draw: Optional[List[int]] = None,
+) -> int:
+    window_draws = draws[-window:] if len(draws) >= window else draws
+    last_seen: Dict[int, int] = {}
 
-        candidates.append((x, score, "; ".join(reasons)))
+    for i, d in enumerate(window_draws):
+        for n in d:
+            if band_lo <= n <= band_hi:
+                last_seen[n] = i
 
-    candidates.sort(key=lambda t: t[1], reverse=True)
-    return candidates[:top_n], phase
+    candidates = list(range(band_lo, band_hi + 1))
 
-# ----------------------------
+    if exclude_recent_draw:
+        ex = set(exclude_recent_draw)
+        filtered = [n for n in candidates if n not in ex]
+        if filtered:
+            candidates = filtered
+
+    last_i = len(window_draws) - 1
+    center = (band_lo + band_hi) / 2
+
+    def score(n: int):
+        gap = (last_i - last_seen[n]) if n in last_seen else (window + 1)
+        return (gap, freq.get(n, 0), -abs(n - center))
+
+    return max(candidates, key=score)
+
+def compute_band_anchors(
+    lunch_draws: List[List[int]],
+    window: int,
+    exclude_latest: bool,
+) -> Dict[str, int]:
+    freq = Counter()
+    for d in lunch_draws:
+        freq.update(d)
+
+    latest = lunch_draws[-1]
+    exclude = latest if exclude_latest else None
+
+    anchors = {}
+    for band, (lo, hi) in BANDS.items():
+        anchors[band] = rolling_gap_anchor(lunch_draws, lo, hi, window, freq, exclude_recent_draw=exclude)
+    return anchors
+
+# -----------------------------
+# 4 duos + repeat injection
+# -----------------------------
+def uniq_duos(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    out = []
+    seen = set()
+    for a, b in pairs:
+        p = tuple(sorted((a, b)))
+        if p[0] == p[1]:
+            continue
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+def build_4_duos(anchors: Dict[str, int]) -> List[Tuple[int, int]]:
+    a20 = anchors["20–29"]
+    a1  = anchors["1–9"]
+    a10 = anchors["10–19"]
+    a30 = anchors["30–39"]
+    a40 = anchors["40–49"]
+
+    duos = [
+        (a20, a1),
+        (a20, a30),
+        (a10, a30),
+        (a20, a40),
+    ]
+    return uniq_duos(duos)
+
+def inject_repeat_into_duos(duos: List[Tuple[int, int]], anchors: Dict[str, int], repeat_num: int) -> Tuple[List[Tuple[int,int]], str]:
+    """
+    If repeat_num already in any duo => no change.
+    Else replace duo (a20, a1) with (a20, repeat_num).
+    """
+    flat = set([x for p in duos for x in p])
+    a20 = anchors["20–29"]
+    a1  = anchors["1–9"]
+
+    if repeat_num in flat:
+        return duos, "Repeat candidate already covered in duos (no change)."
+
+    # Replace the low-band pair
+    new_duos = []
+    replaced = False
+    for a, b in duos:
+        if not replaced and set((a, b)) == set((a20, a1)):
+            new_duos.append(tuple(sorted((a20, repeat_num))))
+            replaced = True
+        else:
+            new_duos.append(tuple(sorted((a, b))))
+
+    new_duos = uniq_duos(new_duos)
+    return new_duos, f"Injected repeat candidate by replacing ({a20},{a1}) with ({a20},{repeat_num})."
+
+# -----------------------------
 # UI
-# ----------------------------
-uploaded = st.file_uploader("Upload Excel/CSV", type=["xlsx", "xls", "csv"])
-
+# -----------------------------
+uploaded = st.file_uploader("Upload your historical sheet", type=["xlsx", "xls", "csv"])
 if not uploaded:
-    st.info("Upload your file to generate bonus candidates.")
+    st.info("Upload a file to start.")
     st.stop()
 
 try:
     df = load_file(uploaded)
-    bonus_col = detect_bonus_col(df)
-    bonuses = safe_bonus_list(df[bonus_col])
 
-    st.success(f"Bonus column detected: {bonus_col}")
-    st.write(f"Total bonus records: {len(bonuses)}")
+    date_col = detect_date_col(df)
+    main_cols = detect_main_cols(df)
 
-    with st.expander("Settings", expanded=True):
-        window = st.slider("Lookback window (bonuses)", 10, 60, 20, 1)
-        strong_thresh = st.slider("Strong move threshold (|delta| > x)", 5, 20, 10, 1)
-        center = st.slider("Center target (1–49 midpoint)", 15, 35, 25, 1)
-        top_n = st.selectbox("How many candidates to show", [5, 10, 15], index=1)
-        exclude_recent_k = st.selectbox("Exclude last K bonuses (optional)", [0, 1, 2, 3, 5], index=0)
+    st.write("Columns detected:", df.columns.tolist())
+    st.success(f"Main columns: {main_cols}")
+    st.info(f"Lunchtime inference: {'First row per date' if date_col else 'Every 2nd row (0,2,4,...)'}")
 
-    if len(bonuses) < 8:
-        st.warning("Not enough bonus history in the file.")
-        st.stop()
+    lunch_df = lunchtime_only(df, date_col)
+    lunch_draws = to_draw_list(lunch_df, main_cols)
 
-    # show last bonuses
-    st.subheader("Recent bonuses")
-    st.write(bonuses[-min(window, len(bonuses)) :])
+    st.write(f"Lunchtime draws detected: {len(lunch_draws)}")
 
-    ranked, phase = generate_candidates(
-        bonuses,
-        window=window,
-        strong_thresh=strong_thresh,
-        center=center,
-        top_n=top_n,
-        exclude_recent_k=exclude_recent_k,
+    # Settings
+    with st.expander("Engine Settings", expanded=True):
+        window = st.slider("Rolling gap window (lunchtime draws)", 10, 60, 20, 1)
+        exclude_latest = st.toggle("Exclude latest Lunchtime numbers when selecting anchors", value=True)
+        min_support = st.slider("Min support before full confidence (repeat engine)", 5, 120, 25, 5)
+
+    # Repeat engine
+    st.subheader("1) Repeat Engine Output")
+    stats = compute_repeat_stats(lunch_draws)
+    yesterday = lunch_draws[-1]
+    st.write("Most recent Lunchtime draw (yesterday-set):", yesterday)
+
+    ranked = rank_yesterday_repeats(
+        yesterday=yesterday,
+        stats=stats,
+        current_transition_index=stats["num_transitions"],
+        min_support=min_support,
     )
 
-    st.subheader("Phase read")
-    st.json(phase)
+    st.dataframe(ranked, use_container_width=True)
 
-    st.subheader(f"🎯 Ranked possible next bonus candidates (Top {top_n})")
-    out_df = pd.DataFrame(ranked, columns=["Candidate", "Score", "Why it ranks high"])
-    st.dataframe(out_df, use_container_width=True)
+    best_repeat = int(ranked.iloc[0]["Number"])
+    backup_repeat = int(ranked.iloc[1]["Number"]) if len(ranked) > 1 else best_repeat
+
+    st.markdown(f"**Best repeat candidate:** `{best_repeat}`")
+    st.markdown(f"**Backup repeat candidate:** `{backup_repeat}`")
+
+    # Duo engine
+    st.subheader("2) Duo Engine Output (Rolling-gap anchors)")
+    anchors = compute_band_anchors(lunch_draws, window=window, exclude_latest=exclude_latest)
+    st.write("Band anchors:", anchors)
+
+    base_duos = build_4_duos(anchors)
+    st.markdown("### Base 4 duos")
+    for i, (a, b) in enumerate(base_duos, start=1):
+        st.markdown(f"**{i}. {a} & {b}**")
+
+    # Inject repeat
+    st.subheader("3) Integrated Output (Repeat injected)")
+    integrated_duos, note = inject_repeat_into_duos(base_duos, anchors, best_repeat)
+    st.info(note)
+
+    for i, (a, b) in enumerate(integrated_duos, start=1):
+        st.markdown(f"**{i}. {a} & {b}**")
+
+    st.caption(
+        "Reminder: This combines two independent ideas: repeat-likelihood (from lunchtime history) "
+        "and band-balanced anchor duos (rolling-gap). It does not guarantee wins."
+    )
 
 except Exception as e:
     st.error(f"Error: {e}")
