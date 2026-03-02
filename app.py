@@ -1,32 +1,25 @@
 # app.py
 # ============================================================
-# Lunchtime Repeat Engine + 4-Duo Generator (Integrated)
-# - Upload Excel/CSV with historical draws (Date + N1..N6 + Bonus optional)
-# - Infers Lunchtime as FIRST row per date (or every 2nd row if no date column)
-# - Computes best REPEAT candidate from yesterday’s Lunchtime draw (historical conditional repeat rate)
-# - Computes 5 band anchors using Rolling WINDOW gap (Method B) from Lunchtime-only history
-# - Generates 4 locked duos (template) and injects repeat candidate into the duo set:
-#     - If repeat candidate already appears in the 4 duos -> keep as-is
-#     - Else replace the LOW-band anchor duo (a20 & a1) with (a20 & repeat_candidate)
-#       (keeps the hub stable while forcing the repeat candidate into the pack)
-#
-# Dependencies: streamlit, pandas, numpy, openpyxl
+# Layered Echo Pack + Replay Mode (Backtest any historical point)
+# - Upload Excel/CSV
+# - Works on ALL draws (Lunch + Teatime) in file order (sorted by Date if present)
+# - Replay Mode lets you choose a historical "current index" i (treated as n-1),
+#   then the app generates a NEXT-draw pack as if draw i is the latest known draw.
 # ============================================================
 
 from __future__ import annotations
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from collections import Counter
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Dict, Tuple
 
-st.set_page_config(page_title="Repeat + Duo Engine", layout="centered")
-st.title("🔁🎯 Repeat + Duo Engine (Lunchtime Only)")
-st.caption("Repeat engineering + Rolling-gap anchors + 4 locked duos (integrated). No guarantees.")
+st.set_page_config(page_title="Layered Echo Pack + Replay", layout="centered")
+st.title("🧠 Layered Echo Pack (Stack2 → n-1 & n-4) + Replay")
+st.caption("Replay any historical point to see what the engine would recommend next.")
 
 # -----------------------------
-# File loading
+# Load + detect columns
 # -----------------------------
 def load_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
@@ -45,27 +38,30 @@ def detect_date_col(df: pd.DataFrame) -> Optional[str]:
 def detect_main_cols(df: pd.DataFrame) -> List[str]:
     cols = list(df.columns)
     low = [str(c).strip().lower() for c in cols]
+    pref = ["n1","n2","n3","n4","n5","n6"]
+    if all(p in low for p in pref):
+        return [cols[low.index(p)] for p in pref]
 
-    preferred_sets = [
-        ["n1", "n2", "n3", "n4", "n5", "n6"],
-        ["num1", "num2", "num3", "num4", "num5", "num6"],
-    ]
-    for pref in preferred_sets:
-        if all(p in low for p in pref):
-            return [cols[low.index(p)] for p in pref]
-
-    numeric_candidates = []
+    numeric = []
     for c in cols:
         s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().mean() >= 0.80:
-            numeric_candidates.append(c)
+        if s.notna().mean() > 0.80:
+            numeric.append(c)
+    if len(numeric) < 6:
+        raise ValueError("Could not detect N1..N6. Rename to N1..N6 or ensure 6 numeric columns exist.")
+    return numeric[:6]
 
-    if len(numeric_candidates) < 6:
-        raise ValueError(
-            "Could not detect 6 main-number columns. Rename headers to N1..N6 (recommended) "
-            "or ensure 6 numeric columns exist."
-        )
-    return numeric_candidates[:6]
+def sorted_all_draws(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
+    dff = df.copy()
+    if date_col:
+        dff[date_col] = pd.to_datetime(dff[date_col], errors="coerce")
+        dff = dff.dropna(subset=[date_col]).copy()
+        dff["_row"] = np.arange(len(dff))
+        dff = dff.sort_values([date_col, "_row"])
+    else:
+        dff["_row"] = np.arange(len(dff))
+        dff = dff.sort_values(["_row"])
+    return dff
 
 def to_draw_list(df: pd.DataFrame, main_cols: List[str]) -> List[List[int]]:
     draws = []
@@ -73,229 +69,132 @@ def to_draw_list(df: pd.DataFrame, main_cols: List[str]) -> List[List[int]]:
         nums = pd.to_numeric(row[main_cols], errors="coerce").dropna().astype(int).tolist()
         if len(nums) == 6 and all(1 <= n <= 49 for n in nums):
             draws.append(nums)
-    if not draws:
-        raise ValueError("No valid 6-number draws found after parsing.")
+    if len(draws) < 6:
+        raise ValueError("Need at least 6 valid draws for n-4 logic.")
     return draws
 
 # -----------------------------
-# Lunchtime-only extraction
+# 20–39 anchors (rolling-gap)
 # -----------------------------
-def lunchtime_only(df: pd.DataFrame, date_col: Optional[str]) -> pd.DataFrame:
-    dfx = df.copy()
+BANDS: Dict[str, Tuple[int,int]] = {"20–29": (20, 29), "30–39": (30, 39)}
+BAND_20_39 = set(range(20, 40))
+BAND_OUTSIDE = set(range(1, 50)) - BAND_20_39
 
-    if date_col is None:
-        # No date column: assume two draws per day in file order
-        return dfx.iloc[::2].reset_index(drop=True)
-
-    dfx[date_col] = pd.to_datetime(dfx[date_col], errors="coerce")
-    dfx = dfx.dropna(subset=[date_col]).copy()
-    dfx["_row_order"] = np.arange(len(dfx))
-    dfx = dfx.sort_values([date_col, "_row_order"], ascending=[True, True])
-
-    lunch = dfx.groupby(date_col, as_index=False).head(1).copy()
-    lunch = lunch.drop(columns=["_row_order"])
-    return lunch.reset_index(drop=True)
-
-# -----------------------------
-# Repeat stats
-# -----------------------------
-def compute_repeat_stats(lunch_draws: List[List[int]]) -> Dict:
-    if len(lunch_draws) < 3:
-        raise ValueError("Need at least 3 Lunchtime draws to analyze repeats.")
-
-    repeat_counts = []
-    appeared_as_prev = Counter()
-    repeated_next = Counter()
-    last_repeat_idx = {}
-
-    for i in range(len(lunch_draws) - 1):
-        prev_set = set(lunch_draws[i])
-        next_set = set(lunch_draws[i + 1])
-        inter = prev_set.intersection(next_set)
-
-        repeat_counts.append(len(inter))
-
-        for n in prev_set:
-            appeared_as_prev[n] += 1
-        for n in inter:
-            repeated_next[n] += 1
-            last_repeat_idx[n] = i
-
-    return {
-        "repeat_counts": repeat_counts,
-        "repeat_dist": Counter(repeat_counts),
-        "appeared_as_prev": appeared_as_prev,
-        "repeated_next": repeated_next,
-        "last_repeat_idx": last_repeat_idx,
-        "num_transitions": len(repeat_counts),
-    }
-
-def band_boost(n: int) -> float:
-    if 20 <= n <= 39:
-        return 0.20
-    if 10 <= n <= 19 or 40 <= n <= 49:
-        return 0.08
-    return 0.00
-
-def rank_yesterday_repeats(
-    yesterday: List[int],
-    stats: Dict,
-    current_transition_index: int,
-    min_support: int = 25,
-) -> pd.DataFrame:
-    appeared = stats["appeared_as_prev"]
-    repeated = stats["repeated_next"]
-    last_rep = stats["last_repeat_idx"]
-
-    rows = []
-    for n in sorted(yesterday):
-        a = appeared.get(n, 0)
-        r = repeated.get(n, 0)
-        p = (r / a) if a > 0 else 0.0
-
-        gap = (current_transition_index - last_rep[n]) if n in last_rep else (current_transition_index + 1)
-        recency_score = np.log1p(gap) / 5.0
-
-        support_factor = min(1.0, a / float(min_support))
-
-        score = 0.0
-        score += 3.0 * p * support_factor
-        score += 0.6 * recency_score
-        score += band_boost(n)
-
-        why = [f"P(repeat|present)={p:.3f} (support={a})", f"gap={gap}"]
-        if band_boost(n) > 0:
-            why.append("band boost")
-
-        rows.append({
-            "Number": n,
-            "Score": score,
-            "Why": "; ".join(why),
-            "Support(prev appearances)": a,
-            "Repeat hits": r,
-        })
-
-    return pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
-
-# -----------------------------
-# Rolling-gap anchors (Method B) from Lunchtime-only history
-# -----------------------------
-BANDS: Dict[str, Tuple[int, int]] = {
-    "1–9": (1, 9),
-    "10–19": (10, 19),
-    "20–29": (20, 29),
-    "30–39": (30, 39),
-    "40–49": (40, 49),
-}
-
-def rolling_gap_anchor(
-    draws: List[List[int]],
-    band_lo: int,
-    band_hi: int,
-    window: int,
-    freq: Counter,
-    exclude_recent_draw: Optional[List[int]] = None,
-) -> int:
-    window_draws = draws[-window:] if len(draws) >= window else draws
-    last_seen: Dict[int, int] = {}
-
-    for i, d in enumerate(window_draws):
+def rolling_gap_anchor(draws: List[List[int]], lo: int, hi: int, window: int, exclude_recent: Optional[List[int]] = None) -> int:
+    recent = draws[-window:] if len(draws) >= window else draws
+    last_seen = {}
+    for i, d in enumerate(recent):
         for n in d:
-            if band_lo <= n <= band_hi:
+            if lo <= n <= hi:
                 last_seen[n] = i
 
-    candidates = list(range(band_lo, band_hi + 1))
-
-    if exclude_recent_draw:
-        ex = set(exclude_recent_draw)
+    candidates = list(range(lo, hi + 1))
+    if exclude_recent:
+        ex = set(exclude_recent)
         filtered = [n for n in candidates if n not in ex]
         if filtered:
             candidates = filtered
 
-    last_i = len(window_draws) - 1
-    center = (band_lo + band_hi) / 2
+    last_i = len(recent) - 1
+    center = (lo + hi) / 2
 
     def score(n: int):
         gap = (last_i - last_seen[n]) if n in last_seen else (window + 1)
-        return (gap, freq.get(n, 0), -abs(n - center))
+        return (gap, -abs(n - center))
 
     return max(candidates, key=score)
 
-def compute_band_anchors(
-    lunch_draws: List[List[int]],
-    window: int,
-    exclude_latest: bool,
-) -> Dict[str, int]:
-    freq = Counter()
-    for d in lunch_draws:
-        freq.update(d)
-
-    latest = lunch_draws[-1]
-    exclude = latest if exclude_latest else None
-
-    anchors = {}
-    for band, (lo, hi) in BANDS.items():
-        anchors[band] = rolling_gap_anchor(lunch_draws, lo, hi, window, freq, exclude_recent_draw=exclude)
-    return anchors
+def compute_20_39_anchors(draws: List[List[int]], window: int, exclude_latest: bool = True) -> List[int]:
+    latest = draws[-1]
+    ex = latest if exclude_latest else None
+    a20 = rolling_gap_anchor(draws, *BANDS["20–29"], window=window, exclude_recent=ex)
+    a30 = rolling_gap_anchor(draws, *BANDS["30–39"], window=window, exclude_recent=ex)
+    return [a20, a30]
 
 # -----------------------------
-# 4 duos + repeat injection
+# Stack2 trigger + Pack builder
 # -----------------------------
-def uniq_duos(pairs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    out = []
-    seen = set()
-    for a, b in pairs:
-        p = tuple(sorted((a, b)))
-        if p[0] == p[1]:
-            continue
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+def stack2_triggers(draws: List[List[int]]) -> bool:
+    # Trigger computed from latest-known history:
+    # n-1 shares 0 with n-2 and 0 with n-3
+    n1 = set(draws[-1])
+    n2 = set(draws[-2])
+    n3 = set(draws[-3])
+    return len(n1 & n2) == 0 and len(n1 & n3) == 0
 
-def build_4_duos(anchors: Dict[str, int]) -> List[Tuple[int, int]]:
-    a20 = anchors["20–29"]
-    a1  = anchors["1–9"]
-    a10 = anchors["10–19"]
-    a30 = anchors["30–39"]
-    a40 = anchors["40–49"]
+def pick_echo_candidates(draws: List[List[int]]) -> Dict[str, List[int]]:
+    n1 = set(draws[-1])
+    n4 = set(draws[-4])
+    return {
+        "n1_out": sorted(list(n1 & BAND_OUTSIDE)),
+        "n4_out": sorted(list(n4 & BAND_OUTSIDE)),
+        "n1_in":  sorted(list(n1 & BAND_20_39)),
+        "n4_in":  sorted(list(n4 & BAND_20_39)),
+    }
 
-    duos = [
-        (a20, a1),
-        (a20, a30),
-        (a10, a30),
-        (a20, a40),
-    ]
-    return uniq_duos(duos)
+def build_next_pack(draws: List[List[int]], window: int, exclude_latest_anchors: bool) -> Dict:
+    anchors = compute_20_39_anchors(draws, window=window, exclude_latest=exclude_latest_anchors)
+    trig = stack2_triggers(draws)
+    echoes = pick_echo_candidates(draws)
 
-def inject_repeat_into_duos(duos: List[Tuple[int, int]], anchors: Dict[str, int], repeat_num: int) -> Tuple[List[Tuple[int,int]], str]:
-    """
-    If repeat_num already in any duo => no change.
-    Else replace duo (a20, a1) with (a20, repeat_num).
-    """
-    flat = set([x for p in duos for x in p])
-    a20 = anchors["20–29"]
-    a1  = anchors["1–9"]
+    pack: List[int] = []
+    notes: List[str] = []
 
-    if repeat_num in flat:
-        return duos, "Repeat candidate already covered in duos (no change)."
+    if trig:
+        notes.append("✅ Stack2 TRIGGERED (n−1 shares 0 with n−2 and n−3). Bias echoes OUTSIDE 20–39.")
 
-    # Replace the low-band pair
-    new_duos = []
-    replaced = False
-    for a, b in duos:
-        if not replaced and set((a, b)) == set((a20, a1)):
-            new_duos.append(tuple(sorted((a20, repeat_num))))
-            replaced = True
-        else:
-            new_duos.append(tuple(sorted((a, b))))
+        # 1 from n-1 (prefer outside)
+        if echoes["n1_out"]:
+            pick = echoes["n1_out"][0]
+            pack.append(pick); notes.append(f"Picked n−1 OUTSIDE 20–39: {pick}")
+        elif echoes["n1_in"]:
+            pick = echoes["n1_in"][0]
+            pack.append(pick); notes.append(f"Fallback n−1 INSIDE 20–39: {pick}")
 
-    new_duos = uniq_duos(new_duos)
-    return new_duos, f"Injected repeat candidate by replacing ({a20},{a1}) with ({a20},{repeat_num})."
+        # 1 from n-4 (prefer outside)
+        if echoes["n4_out"]:
+            pick = echoes["n4_out"][-1]
+            if pick not in pack:
+                pack.append(pick)
+            notes.append(f"Picked n−4 OUTSIDE 20–39: {pick}")
+        elif echoes["n4_in"]:
+            pick = echoes["n4_in"][-1]
+            if pick not in pack:
+                pack.append(pick)
+            notes.append(f"Fallback n−4 INSIDE 20–39: {pick}")
+    else:
+        notes.append("❌ Stack2 not triggered. Using anchors + neutral fill.")
 
-# -----------------------------
+    # Add anchors
+    for a in anchors:
+        if a not in pack:
+            pack.append(a)
+    notes.append(f"Added 20–39 anchors: {anchors}")
+
+    # Fill remaining slots with high-gap OUTSIDE 20–39
+    last_seen = {}
+    for i, d in enumerate(draws):
+        for n in d:
+            last_seen[n] = i
+    cur_i = len(draws) - 1
+
+    outside_candidates = [n for n in range(1, 50) if (n in BAND_OUTSIDE) and (n not in pack)]
+
+    def gap_score(n: int):
+        gap = (cur_i - last_seen[n]) if n in last_seen else (cur_i + 1)
+        return (gap, -abs(n - 25))
+
+    outside_candidates.sort(key=lambda n: gap_score(n), reverse=True)
+
+    while len(pack) < 6 and outside_candidates:
+        pack.append(outside_candidates.pop(0))
+
+    pack = sorted(pack)
+    return {"stack2_triggered": trig, "pack": pack, "anchors_20_39": anchors, "echo_candidates": echoes, "notes": notes}
+
+# ============================================================
 # UI
-# -----------------------------
+# ============================================================
 uploaded = st.file_uploader("Upload your historical sheet", type=["xlsx", "xls", "csv"])
 if not uploaded:
     st.info("Upload a file to start.")
@@ -303,68 +202,71 @@ if not uploaded:
 
 try:
     df = load_file(uploaded)
-
     date_col = detect_date_col(df)
     main_cols = detect_main_cols(df)
+    dff = sorted_all_draws(df, date_col)
+    all_draws = to_draw_list(dff, main_cols)
 
-    st.write("Columns detected:", df.columns.tolist())
-    st.success(f"Main columns: {main_cols}")
-    st.info(f"Lunchtime inference: {'First row per date' if date_col else 'Every 2nd row (0,2,4,...)'}")
+    st.success(f"Parsed valid draws: {len(all_draws)}")
+    st.write("Detected main columns:", main_cols)
 
-    lunch_df = lunchtime_only(df, date_col)
-    lunch_draws = to_draw_list(lunch_df, main_cols)
+    with st.expander("Settings", expanded=True):
+        window = st.slider("Rolling window for 20–39 anchors", 10, 60, 20, 1)
+        exclude_latest_anchors = st.toggle("Exclude latest draw numbers from anchor selection", value=True)
 
-    st.write(f"Lunchtime draws detected: {len(lunch_draws)}")
+        replay = st.toggle("Replay mode (backtest any historical point)", value=True)
+        # We need at least 4 history draws behind the "current" draw to compute n-4,
+        # and we need a "next" draw to compare if you want to score it.
+        max_i = len(all_draws) - 2  # leave 1 draw ahead for evaluation
+        min_i = 4                  # ensures n-4 exists for the slice
+        i = st.slider("Choose current draw index (treated as n−1)", min_i, max_i, max_i)
 
-    # Settings
-    with st.expander("Engine Settings", expanded=True):
-        window = st.slider("Rolling gap window (lunchtime draws)", 10, 60, 20, 1)
-        exclude_latest = st.toggle("Exclude latest Lunchtime numbers when selecting anchors", value=True)
-        min_support = st.slider("Min support before full confidence (repeat engine)", 5, 120, 25, 5)
+        show_eval = st.toggle("Show evaluation vs the actual next draw (n)", value=True)
 
-    # Repeat engine
-    st.subheader("1) Repeat Engine Output")
-    stats = compute_repeat_stats(lunch_draws)
-    yesterday = lunch_draws[-1]
-    st.write("Most recent Lunchtime draw (yesterday-set):", yesterday)
+    # Slice history as if draw i is the latest known draw
+    history = all_draws[: i + 1]           # up to and including i (n-1)
+    actual_next = all_draws[i + 1]         # draw i+1 (n)
 
-    ranked = rank_yesterday_repeats(
-        yesterday=yesterday,
-        stats=stats,
-        current_transition_index=stats["num_transitions"],
-        min_support=min_support,
-    )
+    st.subheader("Context (Replay State)")
+    st.write(f"Current index (n−1): {i}   |   Next index (n): {i+1}")
+    st.write("n−1:", history[-1])
+    st.write("n−2:", history[-2])
+    st.write("n−3:", history[-3])
+    st.write("n−4:", history[-4])
 
-    st.dataframe(ranked, use_container_width=True)
+    result = build_next_pack(history, window=window, exclude_latest_anchors=exclude_latest_anchors)
 
-    best_repeat = int(ranked.iloc[0]["Number"])
-    backup_repeat = int(ranked.iloc[1]["Number"]) if len(ranked) > 1 else best_repeat
+    st.subheader("Engine Output")
+    st.write("Stack2 Triggered:", "✅ YES" if result["stack2_triggered"] else "❌ NO")
+    st.markdown("### Recommended NEXT pack")
+    st.markdown("**" + "  •  ".join(map(str, result["pack"])) + "**")
 
-    st.markdown(f"**Best repeat candidate:** `{best_repeat}`")
-    st.markdown(f"**Backup repeat candidate:** `{backup_repeat}`")
+    with st.expander("Notes / reasoning", expanded=False):
+        for n in result["notes"]:
+            st.write("•", n)
 
-    # Duo engine
-    st.subheader("2) Duo Engine Output (Rolling-gap anchors)")
-    anchors = compute_band_anchors(lunch_draws, window=window, exclude_latest=exclude_latest)
-    st.write("Band anchors:", anchors)
+    with st.expander("Echo candidates (debug)", expanded=False):
+        st.json(result["echo_candidates"])
 
-    base_duos = build_4_duos(anchors)
-    st.markdown("### Base 4 duos")
-    for i, (a, b) in enumerate(base_duos, start=1):
-        st.markdown(f"**{i}. {a} & {b}**")
+    # Optional evaluation
+    if show_eval:
+        st.subheader("Evaluation vs Actual Next Draw")
+        st.write("Actual next draw (n):", actual_next)
 
-    # Inject repeat
-    st.subheader("3) Integrated Output (Repeat injected)")
-    integrated_duos, note = inject_repeat_into_duos(base_duos, anchors, best_repeat)
-    st.info(note)
+        pred_set = set(result["pack"])
+        actual_set = set(actual_next)
 
-    for i, (a, b) in enumerate(integrated_duos, start=1):
-        st.markdown(f"**{i}. {a} & {b}**")
+        matches = sorted(list(pred_set & actual_set))
+        st.write(f"Matches ({len(matches)}):", matches)
 
-    st.caption(
-        "Reminder: This combines two independent ideas: repeat-likelihood (from lunchtime history) "
-        "and band-balanced anchor duos (rolling-gap). It does not guarantee wins."
-    )
+        # Also show if the layered echo events occurred in reality
+        n1 = set(history[-1])
+        n4 = set(history[-4])
+        rep_n1 = sorted(list(actual_set & n1))
+        rep_n4 = sorted(list(actual_set & n4))
+
+        st.write("Actual repeats from n−1:", rep_n1 if rep_n1 else "None")
+        st.write("Actual repeats from n−4:", rep_n4 if rep_n4 else "None")
 
 except Exception as e:
     st.error(f"Error: {e}")
