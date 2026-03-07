@@ -1,147 +1,185 @@
 # app.py
+# ------------------------------------------------------------
+# Human Selection Bias Duo Ranker
+# Paste / type two sets, and it ranks all cross-set duos from:
+# MOST likely chosen by humans  ->  LEAST likely noticed by humans
+#
+# You can use:
+# - 6 main + optional bonus for Set A
+# - 6 main + optional bonus for Set B
+#
+# Example input:
+# 15 19 32 39 42 48 43
+# 6 9 20 27 42 43 5
+# ------------------------------------------------------------
+
+import re
 import streamlit as st
 import pandas as pd
-import numpy as np
-import itertools
 
-st.set_page_config(page_title="n-1 & n-4 Triple Engine", layout="centered")
-st.title("🎯 n−1 & n−4 Triple Engine")
-st.caption("Uploads your sheet → extracts latest n−1 and n−4 → ranks triples (strong ↔ weak).")
+st.set_page_config(page_title="Human Bias Duo Ranker", layout="centered")
+st.title("🧠 Human Selection Bias Duo Ranker")
+st.caption("Ranks cross-set duos from most human-picked to most human-ignored.")
 
-# -----------------------
+# ------------------------------------------------------------
 # Helpers
-# -----------------------
-def detect_main_cols(df: pd.DataFrame):
-    cols = list(df.columns)
-    low = [str(c).strip().lower() for c in cols]
-    pref = ["n1","n2","n3","n4","n5","n6"]
-    if all(p in low for p in pref):
-        return [cols[low.index(p)] for p in pref]
-    # fallback: take first 6 mostly-numeric columns
-    numeric = []
-    for c in cols:
-        s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().mean() > 0.8:
-            numeric.append(c)
-    if len(numeric) < 6:
-        raise ValueError("Could not find 6 main number columns. Ensure N1..N6 exist.")
-    return numeric[:6]
+# ------------------------------------------------------------
+def parse_numbers(text: str) -> list[int]:
+    nums = re.findall(r"\d+", text)
+    values = [int(n) for n in nums]
+    values = [n for n in values if 1 <= n <= 49]
+    return values
 
-def detect_date_col(df: pd.DataFrame):
-    for c in df.columns:
-        if "date" in str(c).strip().lower():
-            return c
-    return None
+def number_human_bias_score(n: int) -> float:
+    """
+    Higher = more likely humans choose it.
+    """
+    score = 0.0
 
-def sort_df(df: pd.DataFrame, date_col: str | None):
-    dff = df.copy()
-    if date_col:
-        dff[date_col] = pd.to_datetime(dff[date_col], errors="coerce")
-        dff = dff.dropna(subset=[date_col]).copy()
-        dff["_row"] = np.arange(len(dff))
-        dff = dff.sort_values([date_col, "_row"])
-    else:
-        dff["_row"] = np.arange(len(dff))
-        dff = dff.sort_values(["_row"])
-    return dff
+    # Popular small/familiar numbers
+    if n in {7, 9, 11, 13, 15, 21, 23, 26, 27, 32, 39, 42, 43, 44, 45, 47, 48, 49}:
+        score += 2.0
 
-def extract_draws(dff: pd.DataFrame, main_cols):
-    draws = []
-    for _, r in dff.iterrows():
-        nums = pd.to_numeric(r[main_cols], errors="coerce").dropna().astype(int).tolist()
-        if len(nums) == 6 and all(1 <= n <= 49 for n in nums):
-            draws.append(nums)
-    if len(draws) < 4:
-        raise ValueError("Need at least 4 valid draws to compute n−4.")
-    return draws
+    # Multiples of 5 / round-ish numbers feel attractive
+    if n % 5 == 0:
+        score += 1.3
 
-# Scoring (same logic as we used)
-BAND_20_39 = set(range(20, 40))
-LOW = set(range(1, 16))
-MID = set(range(16, 30))
-HIGH = set(range(30, 50))
+    # High numbers often feel "strong"
+    if 40 <= n <= 49:
+        score += 1.8
 
-def triple_score(triple, intersection):
-    score = 0
+    # 20s/30s feel balanced / natural
+    if 20 <= n <= 39:
+        score += 1.0
 
-    # intersection anchor is strongest
-    score += sum(4 for n in triple if n in intersection)
+    # Very tiny numbers are often avoided in pairs unless they form a pattern
+    if 1 <= n <= 5:
+        score -= 1.5
 
-    # prefer having at least one 20–39 backbone
-    score += 2 if any(n in BAND_20_39 for n in triple) else 0
-
-    # band dispersion reward (low/mid/high)
-    bands = set()
-    for n in triple:
-        if n in LOW: bands.add("low")
-        elif n in MID: bands.add("mid")
-        else: bands.add("high")
-    score += len(bands)
-
-    # penalty for all low cluster
-    if all(n in LOW for n in triple):
-        score -= 3
+    # Awkward teen-ish middles
+    if n in {12, 14, 16, 17, 18, 19, 24, 28, 29}:
+        score -= 0.8
 
     return score
 
-# -----------------------
+def duo_bias_score(a: int, b: int) -> tuple[float, list[str]]:
+    """
+    Higher = more likely humans choose this duo.
+    """
+    reasons = []
+    score = number_human_bias_score(a) + number_human_bias_score(b)
+
+    x, y = sorted((a, b))
+    diff = y - x
+
+    # Same number (very noticeable if allowed)
+    if a == b:
+        score += 4.5
+        reasons.append("same-number pair")
+
+    # Consecutive / near-consecutive
+    if diff == 1:
+        score += 4.0
+        reasons.append("consecutive")
+    elif diff == 2:
+        score += 2.5
+        reasons.append("near-consecutive")
+    elif diff == 3:
+        score += 1.5
+        reasons.append("tight spacing")
+
+    # Mirror / visually neat
+    if abs(a - b) == 10:
+        score += 2.2
+        reasons.append("mirror spacing ±10")
+
+    # Both high
+    if a >= 40 and b >= 40:
+        score += 2.8
+        reasons.append("double high numbers")
+
+    # Both low = usually less attractive
+    if a <= 15 and b <= 15:
+        score -= 2.8
+        reasons.append("double low cluster")
+
+    # Small + awkward mid often ignored
+    if ({a, b} & {1, 2, 3, 4, 5}) and ({a, b} & {12, 14, 16, 17, 18, 19, 24, 28, 29}):
+        score -= 1.5
+        reasons.append("awkward small+mid")
+
+    # Both in 20-39 = moderate natural appeal
+    if 20 <= a <= 39 and 20 <= b <= 39:
+        score += 1.5
+        reasons.append("mid-band balance")
+
+    # Both weird/plain middles can be overlooked
+    if {a, b}.issubset({12, 14, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 29}):
+        score -= 1.2
+        reasons.append("plain middle pair")
+
+    return score, reasons
+
+def rank_duos(set_a: list[int], set_b: list[int]) -> pd.DataFrame:
+    rows = []
+    for a in set_a:
+        for b in set_b:
+            score, reasons = duo_bias_score(a, b)
+            rows.append({
+                "Set A": a,
+                "Set B": b,
+                "Duo": f"{a}-{b}",
+                "Bias Score": round(score, 2),
+                "Human Bias Reasoning": ", ".join(reasons) if reasons else "neutral structure"
+            })
+    df = pd.DataFrame(rows)
+    df = df.sort_values("Bias Score", ascending=False).reset_index(drop=True)
+    return df
+
+# ------------------------------------------------------------
 # UI
-# -----------------------
-uploaded = st.file_uploader("Upload your Excel/CSV file", type=["xlsx", "xls", "csv"])
-if not uploaded:
-    st.info("Upload a file to start.")
-    st.stop()
+# ------------------------------------------------------------
+col1, col2 = st.columns(2)
 
-try:
-    if uploaded.name.lower().endswith(("xlsx","xls")):
-        df = pd.read_excel(uploaded)
-    else:
-        df = pd.read_csv(uploaded)
+with col1:
+    set_a_text = st.text_area(
+        "Set A numbers",
+        value="15\n19\n32\n39\n42\n48\n43",
+        height=180
+    )
 
-    date_col = detect_date_col(df)
-    main_cols = detect_main_cols(df)
-    dff = sort_df(df, date_col)
-    draws = extract_draws(dff, main_cols)
+with col2:
+    set_b_text = st.text_area(
+        "Set B numbers",
+        value="6\n9\n20\n27\n42\n43\n5",
+        height=180
+    )
 
-    # n-1 and n-4
-    n1 = draws[-1]
-    n4 = draws[-4]
-    s1 = set(n1)
-    s4 = set(n4)
-    inter = s1 & s4
-    pool = sorted(list(s1 | s4))
+show_top = st.slider("Show top / bottom N duos", 5, 25, 10)
 
-    st.subheader("Latest n−1 and n−4")
-    st.write("**n−1 (latest):**", n1)
-    st.write("**n−4:**", n4)
-    st.write("**Intersection:**", sorted(list(inter)) if inter else "None")
-    st.write("**Pool (n−1 ∪ n−4):**", pool)
+if st.button("Rank duos by human bias", type="primary"):
+    set_a = parse_numbers(set_a_text)
+    set_b = parse_numbers(set_b_text)
 
-    with st.expander("Ranking settings", expanded=True):
-        top_k = st.slider("Show Top K strongest triples", 3, 30, 10)
-        bottom_k = st.slider("Show Bottom K weakest triples", 3, 30, 10)
+    if not set_a or not set_b:
+        st.error("Please enter valid numbers for both sets.")
+        st.stop()
 
-    # generate triples
-    triples = list(itertools.combinations(pool, 3))
-    ranked = []
-    for t in triples:
-        ranked.append((t, triple_score(t, inter)))
-    ranked.sort(key=lambda x: x[1], reverse=True)
+    st.subheader("Parsed sets")
+    st.write("**Set A:**", set_a)
+    st.write("**Set B:**", set_b)
 
-    top = ranked[:top_k]
-    bottom = ranked[-bottom_k:][::-1]  # weakest first
+    df_ranked = rank_duos(set_a, set_b)
 
-    st.subheader("✅ Strongest triples")
-    for t, sc in top:
-        st.write(f"{t}  —  score {sc}")
+    st.subheader("Most likely chosen by humans")
+    st.dataframe(df_ranked.head(show_top), use_container_width=True)
 
-    st.subheader("🔻 Weakest triples (least-likely)")
-    for t, sc in bottom:
-        st.write(f"{t}  —  score {sc}")
+    st.subheader("Least likely noticed by humans")
+    st.dataframe(df_ranked.tail(show_top).sort_values("Bias Score"), use_container_width=True)
 
-    # quick “impossible” pick = weakest
-    st.subheader("🎯 Most least-likely triplet")
-    st.markdown(f"### {bottom[0][0]}")
+    most_human = df_ranked.iloc[0]
+    least_human = df_ranked.iloc[-1]
 
-except Exception as e:
-    st.error(f"Error: {e}")
+    st.subheader("Quick takeaway")
+    st.markdown(f"**Most human-picked duo:** `{most_human['Duo']}`")
+    st.markdown(f"**Most human-ignored duo:** `{least_human['Duo']}`")
