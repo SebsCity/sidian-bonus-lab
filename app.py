@@ -1,29 +1,4 @@
 # app.py
-# ------------------------------------------------------------
-# STRICT HUMAN-BLIND / UGLY PAIR RANKER
-# ------------------------------------------------------------
-# Purpose:
-# Rank all cross-set duos from MOST human-blind / ugly
-# to LEAST human-blind / ugly.
-#
-# This version is intentionally strict.
-# It strongly favors pairs that human eyes usually avoid:
-# - double low numbers
-# - tiny numbers (1-10)
-# - awkward/plain middle numbers
-# - no 20-39 backbone
-# - no high-number appeal
-# - ugly spacing
-#
-# Input:
-# Paste Set A and Set B numbers (main + optional bonus if you want)
-#
-# Output:
-# - Most human-blind pairs
-# - Least human-blind pairs
-# - Full ranked table
-# ------------------------------------------------------------
-
 import re
 import streamlit as st
 import pandas as pd
@@ -32,150 +7,121 @@ st.set_page_config(page_title="Strict Human-Blind Pair Ranker", layout="centered
 st.title("🫥 Strict Human-Blind / Ugly Pair Ranker")
 st.caption("Ranks cross-set duos from most ignored by humans to least ignored.")
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
 def parse_numbers(text: str) -> list[int]:
     nums = re.findall(r"\d+", text)
-    values = [int(n) for n in nums]
-    values = [n for n in values if 1 <= n <= 49]
-    return values
+    vals = [int(n) for n in nums if 1 <= int(n) <= 49]
+    return vals
 
-def ugly_pair_score(a: int, b: int) -> tuple[float, list[str]]:
-    """
-    Higher score = more human-blind / uglier / less likely chosen by people.
-    """
+def pair_features(a: int, b: int):
     x, y = sorted((a, b))
     diff = y - x
-    reasons = []
-    score = 0.0
 
-    # --------------------------------------------------------
-    # Strong HUMAN-BLIND boosts
-    # --------------------------------------------------------
-
-    # Double low cluster
-    if x <= 15 and y <= 15:
-        score += 7.0
-        reasons.append("double low cluster")
-
-    # Tiny-number pair
-    if x <= 10 and y <= 10:
-        score += 6.0
-        reasons.append("tiny-number pair")
-
-    # Awkward unattractive numbers
-    awkward = {2, 3, 4, 5, 12, 14, 16, 17, 18, 19, 24, 28, 29}
-    if a in awkward and b in awkward:
-        score += 4.5
-        reasons.append("awkward unattractive pair")
-
-    # Small + awkward-mid combination
     tiny = {1, 2, 3, 4, 5}
-    awkward_mid = {12, 14, 16, 17, 18, 19, 24, 28, 29}
-    if ({a, b} & tiny) and ({a, b} & awkward_mid):
-        score += 3.5
-        reasons.append("small + awkward mid")
-
-    # No 20-39 backbone and no high-number glamour
-    if not (20 <= a <= 39 or 20 <= b <= 39) and not (a >= 40 or b >= 40):
-        score += 3.0
-        reasons.append("no backbone / no high appeal")
-
-    # Plain middle pair often skipped
+    low = set(range(1, 16))
+    awkward = {12, 14, 16, 17, 18, 19, 24, 28, 29}
     plain_middle = {12, 14, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 29}
-    if a in plain_middle and b in plain_middle:
-        score += 3.0
-        reasons.append("plain middle pair")
-
-    # Ugly spacing: not consecutive, not mirror, not neat
-    if diff in {4, 6, 7, 8, 9, 11, 13, 14, 17}:
-        score += 1.5
-        reasons.append("ugly spacing")
-
-    # One low + one plain mid
-    if ((1 <= a <= 15 and b in plain_middle) or (1 <= b <= 15 and a in plain_middle)):
-        score += 2.0
-        reasons.append("low + plain mid")
-
-    # --------------------------------------------------------
-    # Human-attractive penalties
-    # These REDUCE human-blindness score
-    # --------------------------------------------------------
-
-    # Same-number pair looks too obvious
-    if a == b:
-        score -= 8.0
-        reasons.append("same-number obvious")
-
-    # Consecutive / near consecutive are attractive
-    if diff == 1:
-        score -= 5.0
-        reasons.append("consecutive")
-    elif diff == 2:
-        score -= 3.0
-        reasons.append("near-consecutive")
-    elif diff == 3:
-        score -= 1.5
-        reasons.append("tight spacing")
-
-    # Mirror spacing feels neat
-    if diff == 10:
-        score -= 2.5
-        reasons.append("mirror ±10")
-
-    # Double high numbers look strong / attractive
-    if a >= 40 and b >= 40:
-        score -= 4.0
-        reasons.append("double high")
-
-    # Both in 20-39 gives backbone / natural feel
-    if 20 <= a <= 39 and 20 <= b <= 39:
-        score -= 2.5
-        reasons.append("20-39 backbone")
-
-    # Popular-looking numbers people like
     popular = {7, 9, 10, 11, 13, 15, 20, 21, 23, 25, 26, 27, 30, 32, 35, 38, 39, 40, 41, 42, 43, 44, 45, 47, 48, 49}
-    pop_count = sum(1 for n in (a, b) if n in popular)
-    if pop_count:
-        score -= 1.5 * pop_count
-        reasons.append("popular-looking number(s)")
 
-    return round(score, 2), reasons
+    both_tiny = (a in tiny and b in tiny)
+    both_low = (a in low and b in low)
+    both_awkward = (a in awkward and b in awkward)
+    tiny_plus_awkward = ((a in tiny and b in awkward) or (b in tiny and a in awkward))
+    both_plain_middle = (a in plain_middle and b in plain_middle)
+    has_backbone = (20 <= a <= 39) or (20 <= b <= 39)
+    both_backbone = (20 <= a <= 39) and (20 <= b <= 39)
+    both_high = (a >= 40 and b >= 40)
+    consecutive = diff == 1
+    near_consecutive = diff == 2
+    mirror10 = diff == 10
+    pop_count = int(a in popular) + int(b in popular)
+
+    return {
+        "pair": f"{a}-{b}",
+        "a": a,
+        "b": b,
+        "both_tiny": both_tiny,
+        "both_low": both_low,
+        "both_awkward": both_awkward,
+        "tiny_plus_awkward": tiny_plus_awkward,
+        "both_plain_middle": both_plain_middle,
+        "has_backbone": has_backbone,
+        "both_backbone": both_backbone,
+        "both_high": both_high,
+        "consecutive": consecutive,
+        "near_consecutive": near_consecutive,
+        "mirror10": mirror10,
+        "pop_count": pop_count,
+    }
+
+def human_blind_rank_key(a: int, b: int):
+    f = pair_features(a, b)
+
+    # LOWER tuple = MORE human-blind / uglier
+    # This ordering is intentionally hard-coded to force the priority you wanted.
+    return (
+        0 if f["both_tiny"] else 1,
+        0 if f["both_awkward"] else 1,
+        0 if f["tiny_plus_awkward"] else 1,
+        0 if f["both_low"] else 1,
+        0 if f["both_plain_middle"] else 1,
+        1 if f["has_backbone"] else 0,      # no backbone should rank uglier
+        1 if f["both_high"] else 0,         # double-high is attractive, so push down
+        1 if f["consecutive"] else 0,       # consecutive is attractive
+        1 if f["near_consecutive"] else 0,  # near-consecutive is attractive
+        1 if f["mirror10"] else 0,          # mirror spacing is attractive
+        f["pop_count"],                     # fewer popular numbers = uglier
+        max(a, b),                          # tie-breakers
+        min(a, b),
+    )
+
+def explain_pair(a: int, b: int) -> str:
+    f = pair_features(a, b)
+    reasons = []
+    if f["both_tiny"]:
+        reasons.append("tiny-number pair")
+    if f["both_awkward"]:
+        reasons.append("awkward unattractive pair")
+    if f["tiny_plus_awkward"]:
+        reasons.append("small + awkward mid")
+    if f["both_low"]:
+        reasons.append("double low cluster")
+    if f["both_plain_middle"]:
+        reasons.append("plain middle pair")
+    if not f["has_backbone"]:
+        reasons.append("no 20-39 backbone")
+    if not reasons:
+        reasons.append("less ugly / more noticeable")
+    return ", ".join(reasons)
 
 def rank_pairs(set_a: list[int], set_b: list[int]) -> pd.DataFrame:
     rows = []
     for a in set_a:
         for b in set_b:
-            score, reasons = ugly_pair_score(a, b)
             rows.append({
                 "Set A": a,
                 "Set B": b,
                 "Pair": f"{a}-{b}",
-                "Ugly Score": score,
-                "Why": ", ".join(reasons) if reasons else "neutral"
+                "Why": explain_pair(a, b),
+                "SortKey": human_blind_rank_key(a, b),
             })
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(["Ugly Score", "Pair"], ascending=[False, True]).reset_index(drop=True)
-    return df
+    df = df.sort_values("SortKey", ascending=True).reset_index(drop=True)
+    return df.drop(columns=["SortKey"])
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
 left, right = st.columns(2)
 
 with left:
     set_a_text = st.text_area(
         "Set A",
-        value="15\n19\n32\n39\n42\n48\n43",
+        value="5\n12\n23\n26\n47\n49\n39",
         height=180
     )
 
 with right:
     set_b_text = st.text_area(
         "Set B",
-        value="6\n9\n20\n27\n42\n43\n5",
+        value="3\n16\n20\n21\n26\n38\n2",
         height=180
     )
 
@@ -189,21 +135,17 @@ if st.button("Generate strict human-blind ranking", type="primary"):
         st.error("Please enter valid numbers in both sets.")
         st.stop()
 
-    st.subheader("Parsed Sets")
-    st.write("**Set A:**", set_a)
-    st.write("**Set B:**", set_b)
-
     ranked = rank_pairs(set_a, set_b)
 
     st.subheader("🫥 Most human-blind / ugliest pairs")
     st.dataframe(ranked.head(top_n), use_container_width=True)
 
     st.subheader("👀 Least human-blind / most noticeable pairs")
-    st.dataframe(ranked.tail(top_n).sort_values("Ugly Score"), use_container_width=True)
+    st.dataframe(ranked.tail(top_n), use_container_width=True)
 
-    st.subheader("Quick answer")
     st.markdown(f"**Most human-blind pair:** `{ranked.iloc[0]['Pair']}`")
-    st.markdown(f"**Least human-blind pair:** `{ranked.iloc[-1]['Pair']}`")
+    st.markdown(f"**Second:** `{ranked.iloc[1]['Pair']}`")
+    st.markdown(f"**Third:** `{ranked.iloc[2]['Pair']}`")
 
     with st.expander("Full ranking"):
         st.dataframe(ranked, use_container_width=True)
